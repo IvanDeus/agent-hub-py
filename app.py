@@ -25,6 +25,8 @@ BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "logs.html"
 FILE_STORE = BASE_DIR / "file_store"
 FILE_STORE.mkdir(exist_ok=True)
+FAVICON_FILE = BASE_DIR / "favicon.ico"
+FAVICON_ROUTE = "/favicon.ico"
 
 NAUTH = os.environ.get("NAUTH", "")                      # master client token
 AGENT_TOKEN = os.environ.get("AGENT_AUTH_TOKEN", "")     # agents' public token (6-50 chars)
@@ -87,6 +89,7 @@ def _render_log() -> str:
     return ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta http-equiv='refresh' content='5'>"
             "<title>Agent Hub - Event Log</title>"
+            f"<link rel='icon' href='{FAVICON_ROUTE}'>"
             f"<style>{LOG_CSS}</style></head><body>"
             "<header><h1>Agent Hub - Event Log</h1>"
             "<span class='sub'>auto-refresh 5s &middot; append-only &middot; "
@@ -145,6 +148,7 @@ def actor_label() -> str:
 # ----------------------------------------------------------------- onboarding page
 ONBOARDING = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Agent Hub - Orchestrator</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.ico">
 <style>
 :root{--bg:#f5f5f3;--fg:#1c1c1e;--card:#fff;--line:#e3e3df;--muted:#6b6b6f;--acc:#1d4ed8}
 @media(prefers-color-scheme:dark){:root{--bg:#111214;--fg:#e7e7ea;--card:#1a1c1f;--line:#2a2d31;--muted:#8b8f96;--acc:#60a5fa}}
@@ -214,6 +218,7 @@ python3 mock_agent.py --server $HUB --agent-id scout --token "$AGENT_AUTH_TOKEN"
 <tr><td><code>GET /file/&lt;file_id&gt;</code></td><td>agent / NAUTH</td><td>download a stored file</td></tr>
 <tr><td><code>GET /files</code></td><td>agent / NAUTH</td><td>list stored file metadata</td></tr>
 <tr><td><code>GET /logs/&lt;LOG_SECRET_TOKEN&gt;</code></td><td>secret path</td><td>auto-refreshing HTML event log (404 otherwise)</td></tr>
+<tr><td><code>GET /favicon.ico</code></td><td>none</td><td>hub icon, linked from every HTML page</td></tr>
 <tr><td><code>GET /health</code></td><td>none</td><td>liveness for ngrok / monitors</td></tr>
 </table>
 <p class="mut">Requests missing a valid token return this page with HTTP 401. Socket connections
@@ -247,6 +252,14 @@ def require_actor():
 @app.get("/")
 def root():
     return onboarding_response(200)
+
+
+@app.get(FAVICON_ROUTE)
+def favicon():
+    """Unauthenticated: browsers fetch it before any token could apply."""
+    if not FAVICON_FILE.exists():
+        abort(404)
+    return send_file(FAVICON_FILE, mimetype="image/x-icon", max_age=86400)
 
 
 @app.get("/health")
@@ -522,7 +535,8 @@ def on_agent_to_agent(data=None):
 def not_found(_e):
     wants_html = "text/html" in request.headers.get("Accept", "")
     if wants_html:
-        return Response("<!DOCTYPE html><html><head><meta charset='utf-8'><title>404</title></head>"
+        return Response("<!DOCTYPE html><html><head><meta charset='utf-8'><title>404</title>"
+                        "<link rel='icon' href='/favicon.ico'></head>"
                         "<body style='font-family:monospace;background:#111214;color:#e7e7ea;padding:40px'>"
                         "<h1>404 Not Found</h1><p>That path does not exist (bad log token? typo?). "
                         "Start at <a style='color:#60a5fa' href='/'>/ for onboarding</a>.</p>"
@@ -583,3 +597,4 @@ if __name__ == "__main__":
           f"log page = /logs/{LOG_SECRET[:3]}***")
     threading.Thread(target=open_tunnel, daemon=True).start()
     socketio.run(app, host="0.0.0.0", port=HUB_PORT, debug=False, allow_unsafe_werkzeug=True)
+    
