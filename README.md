@@ -56,23 +56,23 @@ The hub refuses to start if any of the first three are missing/invalid. Tokens a
 compared with `secrets.compare_digest`; secrets never appear in logs.
 
 ## Quick start
-
+1. start the hub — it opens its own ngrok tunnel when NGROK_AUTHTOKEN is set
 ```bash
-# 1. start the hub — it opens its own ngrok tunnel when NGROK_AUTHTOKEN is set
 export NAUTH='pick-a-long-master-token'
 export AGENT_AUTH_TOKEN='changeme-agentshared'
 export LOG_SECRET_TOKEN='changeme-secretlogpath'
-export NGROK_AUTHTOKEN='<your-ngrok-authtoken>'   # optional: omit => warns, serves localhost only
+export NGROK_AUTHTOKEN='<your-ngrok-authtoken>'
 python3 app.py
 ```
-
 ```
 HUB=https://<your-id>.ngrok-free.app              # the hub prints "ngrok tunnel up: <url>"
-
-# 2. agents (anywhere behind NAT, outbound only) — see "Running an agent client through the tunnel"
+```
+2. agents (anywhere behind NAT, outbound only) — see "Running an agent client through the tunnel"
+```
 python3 mock_agent.py --server $HUB --agent-id scout --token "$AGENT_AUTH_TOKEN"
-
-# 3. client sends a task
+```
+3. client sends a task
+```
 curl -s -X POST $HUB/agent/scout/message \
   -H "Authorization: Bearer $NAUTH" \
   -H "ngrok-skip-browser-warning: true" \
