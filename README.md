@@ -3,8 +3,10 @@
 A lightweight Python central server that bridges HTTP clients and multiple AI agents stuck
 behind NAT. Agents make **outbound-only** persistent Socket.IO connections to the hub;
 clients POST tasks by `agent_id`, and the hub routes messages and files
-(JSON / TXT / TAR.GZ / HTML) both ways. One external **ngrok** tunnel exposes the local
-HTTP server as HTTPS — no port forwarding, no inbound firewall holes.
+(JSON / TXT / TAR.GZ / HTML) both ways. Set `NGROK_AUTHTOKEN` and the hub opens its own
+**ngrok** tunnel through the `ngrok` SDK (`import ngrok`) and serves HTTPS — no port
+forwarding, no inbound firewall holes, no second process. Without that token it warns and
+serves on `localhost` only.
 
 ```
                     ┌───────────────┐  ngrok HTTPS tunnel  ┌──────────────┐
@@ -39,11 +41,12 @@ HTTP server as HTTPS — no port forwarding, no inbound firewall holes.
 ## Requirements
 
 ```bash
-python3 -m pip install -r requirements.txt   # Flask, Flask-SocketIO, python-socketio, requests
+python3 -m pip install -r requirements.txt   # Flask, Flask-SocketIO, python-socketio, requests, ngrok
 ```
 
 Tested with Python 3.13 / Flask 3.1 / Flask-SocketIO 5.3 (threading async mode —
-no monkey-patching needed).
+no monkey-patching needed). The `ngrok` package is optional: if it is missing, or
+`NGROK_AUTHTOKEN` is unset, the hub skips the tunnel and still runs locally.
 
 ## Environment variables
 
@@ -52,7 +55,7 @@ no monkey-patching needed).
 | `NAUTH` | Master token for HTTP clients (`Authorization: Bearer …`) | required |
 | `AGENT_AUTH_TOKEN` | Token agents use for socket + HTTP ops (`X-Agent-Token`) | required, 6–50 chars |
 | `LOG_SECRET_TOKEN` | Secret URL segment for the live log page `/logs/<token>` | required, 4–64 URL-safe chars |
-| `NGROK_AUTHTOKEN` | Only for the ngrok process itself (never given to the hub) | required to open the tunnel |
+| `NGROK_AUTHTOKEN` | The hub opens its own ngrok tunnel with it (via `import ngrok`) | optional — unset ⇒ warns, localhost only |
 | `HUB_PORT` | Hub listen port | default `5000` |
 | `ACK_TIMEOUT` | Seconds the hub waits for an agent reply | default `10` |
 
@@ -62,21 +65,18 @@ compared with `secrets.compare_digest`; secrets never appear in logs.
 ## Quick start
 
 ```bash
-# 1. start the hub (local HTTP)
+# 1. start the hub — it opens its own ngrok tunnel when NGROK_AUTHTOKEN is set
 export NAUTH='pick-a-long-master-token'
 export AGENT_AUTH_TOKEN='changeme-agentshared'
 export LOG_SECRET_TOKEN='changeme-secretlogpath'
+export NGROK_AUTHTOKEN='<your-ngrok-authtoken>'   # optional: omit => warns, serves localhost only
 python3 app.py
+HUB=https://<your-id>.ngrok-free.app              # the hub prints "ngrok tunnel up: <url>"
 
-# 2. expose it with one ngrok tunnel
-export NGROK_AUTHTOKEN='<your-ngrok-authtoken>'
-ngrok http 5000
-HUB=https://<your-id>.ngrok-free.app          # read from ngrok's local API: curl -s localhost:4040/api/tunnels
-
-# 3. agents (anywhere behind NAT, outbound only)
+# 2. agents (anywhere behind NAT, outbound only) — see "Running an agent client through the tunnel"
 python3 mock_agent.py --server $HUB --agent-id scout --token "$AGENT_AUTH_TOKEN"
 
-# 4. client sends a task
+# 3. client sends a task
 curl -s -X POST $HUB/agent/scout/message \
   -H "Authorization: Bearer $NAUTH" \
   -H "ngrok-skip-browser-warning: true" \
@@ -84,8 +84,86 @@ curl -s -X POST $HUB/agent/scout/message \
   -d '{"text": "scan the dataset and report"}'
 ```
 
+Without `NGROK_AUTHTOKEN` everything below step 1 runs the same way against
+`HUB=http://localhost:5000` — only the public URL is missing.
+
 Open `$HUB/` in a browser any time for the full onboarding/auth reference; the hub
 also serves it (with `401`) when a request arrives without a valid token.
+
+## Running an agent client through the tunnel
+
+Agents run anywhere — laptop, container, VM behind NAT — and only ever make **outbound**
+calls, so they need two things: the hub's public URL and the shared agent token. As soon as
+the tunnel is up the hub prints a ready-to-paste command for exactly that:
+
+```
+[agent-hub] ngrok tunnel up: https://<your-id>.ngrok-free.app
+[agent-hub]   agents:  python3 mock_agent.py --server https://<your-id>.ngrok-free.app --agent-id <id> --token "$AGENT_AUTH_TOKEN"
+```
+
+Copy the URL and run it on the agent machine:
+
+```bash
+python3 -m pip install requests python-socketio      # agent-side deps only (no Flask)
+
+export AGENT_AUTH_TOKEN='changeme-agentshared'        # must match the hub
+python3 mock_agent.py --server https://<your-id>.ngrok-free.app --agent-id scout --token "$AGENT_AUTH_TOKEN"
+```
+
+All three flags fall back to env vars, which is handier for a fleet of agents sharing one
+shell block (only `AGENT_ID` has to be unique):
+
+```bash
+export HUB_URL=https://<your-id>.ngrok-free.app    # the tunnel URL
+export AGENT_ID=builder
+export AGENT_AUTH_TOKEN='changeme-agentshared'
+python3 mock_agent.py
+```
+
+### Confirm the agent reached the hub
+
+```bash
+curl -s $HUB_URL/health
+# {"agents_connected":1,"status":"ok","uptime":"see logs"}
+
+curl -s $HUB_URL/agents -H "X-Agent-Token: $AGENT_AUTH_TOKEN" -H "X-Agent-Id: $AGENT_ID" \
+     -H "ngrok-skip-browser-warning: true"
+# {"agents":{"builder":"<sid>"}}
+
+python3 mock_agent.py --agents        # same list, agent auth headers built in
+```
+
+The operator log page at `$HUB_URL/logs/$LOG_SECRET_TOKEN` should carry a `CONNECTED` row
+for that agent id, and the agent process prints
+`agent 'builder' listening | inbox=… | outbox=…`.
+
+### More work over the same tunnel
+
+One-shot helpers exit after one request, and each already sends
+`ngrok-skip-browser-warning: true` so ngrok's interstitial page never gets in the way:
+
+```bash
+python3 mock_agent.py --relay-to scout --text "findings ready"    # POST /relay
+python3 mock_agent.py --upload work/report.html --to reviewer     # POST /file + file_ready push
+python3 mock_agent.py --download <file_id>                        # -> state/<agent-id>/downloads/
+```
+
+A persistent agent appends everything it receives (tasks, peer messages, downloaded files)
+to `state/<agent-id>/inbox.jsonl` and acts on JSON lines appended to
+`state/<agent-id>/outbox.jsonl` — see [mock_agent.py](#mock_agentpy).
+
+### Tunnel gotchas
+
+- **The URL changes on every hub start** — ngrok free tier mints a random subdomain. Re-copy
+  it into `HUB_URL` / `--server` after a restart, or reserve a static domain in the ngrok
+  dashboard and pass it in `open_tunnel()`:
+  `ngrok.forward(f"localhost:{HUB_PORT}", proto="http", domain="<your>.ngrok.app")`.
+- **Always use the `https://` URL**, never `http://localhost:5000`, on a machine that is not
+  the hub. Localhost is only reachable there — and is all you get when `NGROK_AUTHTOKEN` is
+  unset and the hub skipped the tunnel.
+- **Agents authenticate with `AGENT_AUTH_TOKEN`, not `NAUTH`** (that is the client token). A
+  wrong agent token still reaches the tunnel fine, then gets rejected at the socket and
+  logged as `AUTH_FAIL`.
 
 ## HTTP API
 
@@ -98,7 +176,7 @@ Always add `ngrok-skip-browser-warning: true` when traffic crosses ngrok free ti
 |---|---|
 | `GET /` | Onboarding page (no auth) |
 | `GET /health` | Liveness (no auth) |
-| `GET /agents` | Currently connected agents `{agent_id: sid}` |
+| `GET /agents` | Currently connected agents — `{"agents": {agent_id: sid}}` |
 | `POST /agent/<id>/message` | Body `{"text": …}` → routed to agent, returns its reply. Offline ⇒ `404`. `?wait=<0-60>` reply budget |
 | `GET /agent/<id>/inbox` | Drain queued unsolicited agent→client messages |
 | `POST /relay` | Body `{"to": "<agent_id>", "text": …}` → hub pushes to that agent |
@@ -153,6 +231,7 @@ return `404` in ~10 ms; bogus log token ⇒ `404`.
 |---|---|
 | Response is an ngrok HTML warning page | Add `-H "ngrok-skip-browser-warning: true"` |
 | Agent `CONNECT FAILED` | Token mismatch (`AUTH_FAIL` in log) or tunnel down (`/health`) |
+| Agent stopped reaching the hub | Tunnel URL changed on hub restart — re-copy the `ngrok tunnel up:` URL |
 | `404 agent is offline` | Agent process died; hub never hangs on it — restart the agent |
 | No reply, `status: delivered_no_ack` | Agent's socket alive but worker too slow; raise `?wait=` |
 | Log page 404 | Use the exact `LOG_SECRET_TOKEN` value: `/logs/$LOG_SECRET_TOKEN` |
@@ -162,7 +241,7 @@ return `404` in ~10 ms; bogus log token ⇒ `404`.
 > a real HTTPS reverse proxy and rotate all three tokens.
 
 ## License
-
 MIT
 ---
+
 2026 [ ivan deus ]
