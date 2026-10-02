@@ -25,15 +25,76 @@ serves on `localhost` only.
   (`LOG_SECRET_TOKEN`). Any holder gets full access: tasking any agent, draining any
   inbox, moving files. Missing/invalid ⇒ `401` + onboarding page, agents rejected on
   connect and logged as `AUTH_FAIL`.
-- **Self-elected roles** — the hub enforces no hierarchy. Agents vote among themselves, over
-  `/relay` and `agent_to_agent`, for who acts as master — see
-  [Agent role voting](#agent-role-voting).
+- **Agent-first surface** — the hub is designed for AI callers: unauthenticated
+  `GET /llms.txt` (markdown API guide) and `GET /api` (JSON manifest incl. the socket
+  contract); every error returns JSON with an actionable `hint` (HTML only when you
+  `Accept: text/html`); capability discovery via `version` + `features` on `/health`;
+  `GET /client.py` serves the reference agent client so a remote agent can fetch the code
+  it needs in one call.
+- **Reply correlation** — `POST /agent/<id>/message` answers with the *first* `result`, so
+  `GET /result/<msg_id>` keeps every result recorded against that `msg_id` (last 500 tasks)
+  and reports `first_result` / `done` / `answered_via_inbox`.
+- **No orphaned sockets** — losing an `agent_id` take-over sends the loser `superseded` and
+  keeps it as a visible standby; when the winner disconnects it gets `reactivated` and its
+  routing back instead of dying silently.
+- **Unique `agent_id`s** (v1.4) — a second socket that connects with an already-live id is
+  **refused at connect** with a reason naming the holder, and the attempt is logged as
+  `ID_REJECTED` instead of silently stealing that agent's traffic. Pre-flight
+  `GET /agent-id/<id>`, or push through deliberately with `auth {"force_takeover": true}`
+  / `?force=1` (the v1.3 standby chain still applies).
 - **ngrok free tier** — every client should send `ngrok-skip-browser-warning: true`
   or ngrok returns its interstitial HTML page instead of your API response.
 - **Operator log viewer** — append-only `logs.html` with a 5 s auto-refreshing
   dark/light page at `/logs/<LOG_SECRET_TOKEN>` (404 for any wrong token), colored
-  badges: `CONNECTED` `DISCONNECTED` `MSG_SENT` `MSG_RCVD` `AUTH_FAIL`
-  `FILE_SENT` `FILE_RCVD` `MSG_FAIL`.
+  badges: `CONNECTED` `DISCONNECTED` `MSG_SENT` `MSG_RCVD` `AUTH_FAIL` `ID_REJECTED`
+  `FILE_SENT` `FILE_RCVD` `MSG_FAIL`. Agents get their own slice without the log secret
+  via `GET /events/mine`; `?peek=true` makes inbox reads non-destructive; `?dedupe=1`
+  makes re-uploading identical bytes a no-op; a stolen `agent_id` now sends the loser a
+  `superseded` event instead of stealing traffic in silence.
+
+## Changelog
+
+- **v1.4.0** — **`agent_id` is now unique per live socket.** Before this, a second agent
+  registering an id that was already connected quietly *became* that agent: the first one kept
+  its socket open but stopped receiving traffic (v1.2 named the symptom `superseded`, v1.3 gave
+  it a standby + reclaim path — neither stopped it happening). Now `connect` **refuses** the
+  duplicate: the client gets a `connect_error` naming the holder's sid and `connected_at`, the
+  hub logs `ID_REJECTED`, and `GET /agent-id/<id>` answers "is this name free, who holds it,
+  when was it last refused" *before* you connect. `mock_agent.py` prints that verdict
+  automatically on refusal (`--check-id <id>`, `--force-takeover` added). Opt-in escape hatch
+  for operators who do mean to displace an agent: `auth {"force_takeover": true}` or
+  `?force=1`, which behaves exactly like the v1.3 take-over (loser → standby → `reactivated`).
+  Hub-side behaviour only; no response shape changed, so agents written against v1.0–v1.3 keep
+  working — they just need a name nobody holds. Feature flag: `unique_agent_ids`.
+- **v1.3.1** — found by the *other* agent on the live mesh: `superseded`/`reactivated` now carry
+  `sid` + `sid_note`, because the hub's registry sid is the **`/agents` namespace** sid while
+  python-socketio's `sio.sid` is the transport sid — a client self-checking `event.sid ==
+  sio.sid` always got a false mismatch and assumed the event was for somebody else. Compare
+  `sio.get_sid(namespace="/agents")` instead (`mock_agent.py` does and logs the verdict). Two
+  new gotchas: a task's `from` is a caller-chosen label, never evidence of who posted it; and
+  callers should keep one stable `X-Agent-Id`.
+- **v1.3.0** — found by dogfooding v1.2 with the second real agent on the hub:
+  a socket that loses an `agent_id` take-over now stays registered as a **standby**
+  (`/agents` → `standby`, `detail[id].standby_sockets`) and receives **`reactivated`** plus its
+  routing back when the winner disconnects — previously it was orphaned while still open
+  (registry went empty, the live process got nothing). `GET /result/<msg_id>` gains `count` +
+  `note` and the `answered_via_inbox` status (agents that reply over `agent_to_client` instead
+  of `result` no longer leave a task stuck at `first_result`; `mock_agent.py` now forwards
+  `msg_id` on its `to_client` action), and the 404 for an evicted `msg_id` explains the
+  500-task window. Inbox entries always carry `ts` now, from either path.
+- **v1.2.1** — event log now writes **one `MSG_RCVD` row per agent result** (v1.2.0 logged
+  every result twice, once from the socket handler and once from the HTTP route). Rows are
+  also self-describing now: `Agent -> Server -> Client (HTTP reply)` vs
+  `Agent -> Server (recorded, no HTTP waiter)` for late/`?wait=0` results. No API change.
+- **v1.2.0** — `GET /result/<msg_id>`, `GET /events/mine`, `GET /client.py`,
+  `POST /file?dedupe=1`, `superseded` socket event + `detail[id].last_superseded_at`,
+  `msg_id` tagged on inbox entries and `MSG_SENT`/`MSG_RCVD` log rows. All additive;
+  no response shape or default changed.
+- **v1.1.0** — `/llms.txt` + `/api` manifest, JSON error contract with hints, 405/404/500
+  handlers, `file_store/index.json` persistence + legacy adoption, `events.json` log API,
+  `?peek`, `?wait`, `duplicate_of`, `sha256` on upload, `HUB_BIND`/`NGROK_DOMAIN`/
+  `HUB_FILE_STORE`/`HUB_LOG_FILE`/`HUB_DEBUG`, `selftest.py`, onboarding rebuilt from the
+  same source of truth.
 
 ## Requirements
 
@@ -53,7 +114,11 @@ no monkey-patching needed). The `ngrok` package is optional: if it is missing, o
 | `LOG_SECRET_TOKEN` | Secret URL segment for the live log page `/logs/<token>` | required, 4–64 URL-safe chars |
 | `NGROK_AUTHTOKEN` | The hub opens its own ngrok tunnel with it (via `import ngrok`) | optional — unset ⇒ warns, localhost only |
 | `HUB_PORT` | Hub listen port | default `5000` |
+| `HUB_BIND` | Hub listen interface | default `0.0.0.0` — use `127.0.0.1` for isolated tests |
 | `ACK_TIMEOUT` | Seconds the hub waits for an agent reply | default `10` |
+| `NGROK_DOMAIN` | Reserved ngrok domain passed to `ngrok.forward()` — the public URL survives restarts | optional — needs a domain claimed in the ngrok dashboard |
+| `HUB_FILE_STORE` / `HUB_LOG_FILE` | Relocate `file_store/` / `logs.html` (test isolation) | optional — default next to `app.py` |
+| `HUB_DEBUG` | `1` includes exception detail in 500 responses | optional — off by default (leaks internals) |
 
 The hub refuses to start if either token is missing/invalid. Tokens are
 compared with `secrets.compare_digest`; secrets never appear in logs.
@@ -86,8 +151,13 @@ curl -s -X POST $HUB/agent/scout/message \
 Without `NGROK_AUTHTOKEN` everything below step 1 runs the same way against
 `HUB=http://localhost:5000` — only the public URL is missing.
 
-Open `$HUB/` in a browser any time for the full onboarding/auth reference; the hub
-also serves it (with `401`) when a request arrives without a valid token.
+Open `$HUB/` in a browser any time for the full onboarding reference. If **you are the
+agent**, fetch the canonical guide instead — it is plain markdown and needs no token:
+
+```bash
+curl -s $HUB/llms.txt                          # API guide for LLM agents
+curl -s $HUB/api | python3 -m json.tool        # machine manifest (endpoints + socket contract)
+```
 
 ## Running an agent client through the tunnel
 
@@ -110,7 +180,8 @@ python3 mock_agent.py --server https://<your-id>.ngrok-free.app --agent-id scout
 ```
 
 All three flags fall back to env vars, which is handier for a fleet of agents sharing one
-shell block (only `AGENT_ID` has to be unique):
+shell block (only `AGENT_ID` has to be unique — since v1.4 the hub *enforces* it, so a
+duplicate connect is refused rather than silently stealing traffic):
 
 ```bash
 export HUB_URL=https://<your-id>.ngrok-free.app    # the tunnel URL
@@ -154,9 +225,9 @@ to `state/<agent-id>/inbox.jsonl` and acts on JSON lines appended to
 ### Tunnel gotchas
 
 - **The URL changes on every hub start** — ngrok free tier mints a random subdomain. Re-copy
-  it into `HUB_URL` / `--server` after a restart, or reserve a static domain in the ngrok
-  dashboard and pass it in `open_tunnel()`:
-  `ngrok.forward(f"localhost:{HUB_PORT}", proto="http", domain="<your>.ngrok.app")`.
+  it into `HUB_URL` / `--server` after a restart, or claim a free static domain in the ngrok
+  dashboard and set `NGROK_DOMAIN=<your-id>.ngrok.app` — the hub passes it to `ngrok.forward()`
+  and the URL stops churning. `GET /health` echoes the live public URL in `public_url`.
 - **Always use the `https://` URL**, never `http://localhost:5000`, on a machine that is not
   the hub. Localhost is only reachable there — and is all you get when `NGROK_AUTHTOKEN` is
   unset and the hub skipped the tunnel.
@@ -174,50 +245,40 @@ Always add `ngrok-skip-browser-warning: true` when traffic crosses ngrok free ti
 
 | Method & path | Description |
 |---|---|
-| `GET /` | Onboarding page (no auth) |
-| `GET /health` | Liveness (no auth) |
-| `GET /agents` | Currently connected agents — `{"agents": {agent_id: sid}}` |
-| `POST /agent/<id>/message` | Body `{"text": …}` → routed to agent, returns its reply. Offline ⇒ `404`. `?wait=<0-60>` reply budget |
-| `GET /agent/<id>/inbox` | Drain queued unsolicited agent→client messages |
-| `POST /relay` | Body `{"to": "<agent_id>", "text": …}` → hub pushes to that agent |
-| `POST /file` | `multipart file=@…` or raw body + `X-Filename`. Optional `X-Target-Agent` pushes a notify. Allowed ext: `.json .txt .html .tar.gz .tgz` ≤ 25 MB |
-| `GET /files` | File metadata table |
+| `GET /` | Onboarding page (no auth; also the 401 body for browsers) |
+| `GET /health` | Liveness + `version` + `features` + `public_url` (no auth) |
+| `GET /llms.txt` | Markdown API guide for agents (no auth) |
+| `GET /api` | JSON manifest: endpoints, socket contract, footguns, auth model (no auth) |
+| `GET /agents` | Connected agents — `{agents:{id:sid}}` (stable shape) plus `count`, `agent_ids`, `detail{id:{sid, connected_at, last_superseded_at, standby_sockets}}`, `standby{id:{sid:since}}` |
+| `GET /agent-id/<id>` | Pre-flight the v1.4 uniqueness rule: `{agent_id, available, taken_by_sid, connected_at, standby_sockets, last_rejection}` — free/never-seen ids return `200 available:true`, malformed ⇒ `400` with the pattern |
+| `POST /agent/<id>/message` | Body `{"text": …}` → routed to agent, returns its **first** reply. Offline ⇒ `404` with start-one hint. `?wait=<0-60>` budget. Caveat: mock_agent auto-ACKs, so `status:"replied"` usually means *received* — poll `GET /result/<msg_id>` or the inbox for the rest |
+| `GET /result/<msg_id>` | Every `result` the hub recorded for one task (last 500 msg_ids, this process only) — `{msg_id, agent, results[], count, status:"first_result"\|"done"\|"answered_via_inbox", answered_via_inbox, updated, note}`. Unknown ⇒ `404` explaining the window |
+| `GET /agent/<id>/inbox` | Unsolicited agent→client messages. **Drains and clears by default** — add `?peek=true` to inspect non-destructively. Returns `drained`, `queue_max`, `agent_online`; entries carry `msg_id` when the sender tagged one |
+| `POST /relay` | Body `{"to": "<agent_id>", "text": …}` → hub pushes `peer_msg` to that agent |
+| `POST /file` | `multipart file=@…` or raw body + `X-Filename` (a raw `application/json` body with no `X-Filename` is stored as `body.json`). Optional `X-Target-Agent` pushes a notify; wrong id ⇒ 201 with `target_error`, never silent. Allowed ext: `.json .txt .html .tar.gz .tgz` ≤ 25 MB, ASCII names. 201 returns `sha256`, `delivered`, `duplicate_of` (advisory). **`?dedupe=1`** ⇒ identical bytes already stored returns `200 {status:"existing", file_id:<old>, deduped:true, bytes_stored:false}` instead of a new id |
+| `GET /files` | File metadata table + `count` (persists across restarts via `file_store/index.json`; objects left by pre-v1.1 hubs are auto-adopted from disk at startup) |
 | `GET /file/<file_id>` | Download a stored file |
+| `GET /events/mine` | Structured event rows involving **you** (`X-Agent-Id` required ⇒ `400` without) — `?limit=1-500`, default 100. Agents hold the full-access token but usually not the log secret, so this is their view of the log |
+| `GET /client.py` | The reference agent client (`mock_agent.py`) as plain Python text — `curl -s $HUB/client.py -H "Authorization: Bearer $T" -o mock_agent.py` |
 | `GET /logs/<LOG_SECRET_TOKEN>` | Auto-refreshing HTML event log. **Any other token ⇒ 404** |
+| `GET /logs/<LOG_SECRET_TOKEN>/events.json` | Structured event log for agents, `?limit=1-3000` (default 50), newest last |
+
+**Error contract:** every error is JSON `{error, hint, docs:"/llms.txt", api:"/api", …}` with
+the fix spelled out — `400` shape/agent_id (pattern `[A-Za-z0-9_-]{1,40}`), `401` token,
+`404` offline/unknown, `405` wrong verb (valid methods listed), `413` >25 MB, `415` rejected
+filetype (echoes `name_after_sanitize`), `500` internal (detail only with `HUB_DEBUG=1`).
+Browsers (`Accept: text/html`) keep the HTML onboarding/404 pages.
 
 Socket.IO namespace `/agents`, agent-side events: receives `task`, `peer_msg`,
-`file_ready`; sends `result` (replies), `agent_to_client`, `agent_to_agent`.
-
-## Agent role voting
-
-The hub has **no master**. It cannot tell an operator from an agent, so agents elect their own
-roles over the channels they already have — no hub code, no new hub state, and an election
-survives a hub restart.
-
-One round, driven by whichever agent is calling:
-
-1. **Open the ballot** — from the caller's `state/<id>/outbox.jsonl`, nominate to every peer:
-   `{"action":"to_agent","to":"scout","text":"ELECTION round=3 vote for <agent_id>"}`
-   (a peer can equally `POST /relay` with that body).
-2. **Cast votes to the caller** — each agent replies
-   `{"action":"to_agent","to":"<caller>","text":"VOTE round=3 for=builder"}`. The caller gets
-   these as `peer_msg` events, which `mock_agent.py` appends to its own
-   `state/<caller>/inbox.jsonl`.
-3. **Tally** — the caller counts the `VOTE round=3` lines in its own inbox and declares a winner.
-4. **Hand over** — the elected master now drives everyone with `POST /agent/<id>/message`.
-   Nothing flips on the hub: with one shared token every agent could always do this, so *winning
-   the vote is itself the promotion*.
-5. **Publish the result** — write it with `POST /file` + `X-Target-Agent` so agents that join
-   mid-round can read who the current master is.
-
-Re-vote on a timer, or when the master stops replying to `task` events. Quorum, term length and
-tie-breaks belong in the message text — keep them there, not in the hub, which stays a dumb
-switchboard.
-
-> **Do not use `GET /agent/<id>/inbox` to collect ballots.** It *drains and clears* that agent's
-> operator queue (`maxlen=200`), so it would silently eat messages meant for the human. It can
-> reach a peer's inbox only because one token grants full access — that is an inspection
-> affordance, not a transport. Route ballots through `peer_msg` instead.
+`file_ready`, `superseded` (sent to the old socket when another process registers the same
+`agent_id`) and `reactivated` (sent to that standby when the winner disconnects — its routing
+comes back, no restart needed); sends `result` (replies), `agent_to_client` (optional `msg_id`
+tag ⇒ `GET /result/<msg_id>` reports `answered_via_inbox`), `agent_to_agent`. Exact payloads:
+`GET /api` → `socket`. **`connect` auth is `{"token": …, "agent_id": …}`** and, since v1.4, an
+id that is already live is refused with a reason naming the holder unless you also send
+`"force_takeover": true` (or `?force=1` on the query string). Two-phase replies: the first
+`result` satisfies the HTTP call; **every** result is kept under its `msg_id` for
+`GET /result/<msg_id>`, and untagged late results are queued to the agent's client inbox too.
 
 ## mock_agent.py
 
@@ -229,15 +290,37 @@ the operator appends one JSON action per line to `state/<agent_id>/outbox.jsonl`
 ```json
 {"action":"to_agent","to":"builder","text":"findings ready"}
 {"action":"reply","msg_id":"…","text":"late answer to a task"}
-{"action":"to_client","text":"summary for the human"}
+{"action":"to_client","text":"summary for the human","msg_id":"optional — tags the task"}
 {"action":"upload","path":"work/report.html","to":"reviewer"}
 ```
 
 Everything the agent receives is appended to `state/<agent_id>/inbox.jsonl`
 (tasks, peer messages, downloaded files with `sha_ok` verdicts, action acks); pushed
-files are auto-downloaded to `state/<agent_id>/downloads/`. One-shot helpers:
-`--relay-to <id> --text …`, `--upload <path> --to <id>`, `--download <file_id>`,
-`--agents`.
+files are auto-downloaded to `state/<agent_id>/downloads/`. State root = `$HUB_STATE_DIR`
+or `./state` next to the script.
+
+One-shot helpers (each prints parsed JSON, or a readable error instead of a traceback):
+`--message <id> --text …` [`--wait <s>`] — send a task and print the reply (reminder: with
+mock_agent that reply is the instant ACK; poll `--inbox <id> --peek` for the real answer) ·
+`--inbox <id> [--peek]` — read/drain the client queue · `--relay-to <id> --text …` ·
+`--upload <path> --to <id>` · `--download <file_id>` · `--agents` · `--check-id <id>` (is that
+name free?) · `--health` · `--docs`. Persistent mode takes `--force-takeover` (env
+`HUB_FORCE_TAKEOVER=1`) to displace a live holder, and if the hub refuses the connect it prints
+who holds the id plus the two ways forward instead of a stack trace.
+One-shot mode labels itself `operator` unless you pass `--agent-id`.
+
+## For AI agents
+
+If you are an LLM agent wired into this hub: start with `GET /llms.txt` (no token needed),
+keep `GET /api` as the machine-readable contract, and read the **Gotchas** section of
+`/llms.txt` before scripting — the inbox is destructive by default, `replied` usually means
+"ACKed, not done", and since v1.4 an `agent_id` that is already connected is *refused* rather
+than silently taken over (`GET /agent-id/<id>` first, or `force_takeover`). You need no local
+checkout: `GET /client.py` (token) returns the reference agent client, and
+`GET /events/mine?limit=50` shows what the hub did with you without the operator's log secret.
+Run `python3 selftest.py --server $HUB --token $AGENT_AUTH_TOKEN` to verify a hub implements
+the v1.4 contract end-to-end (exit 0 = healthy; safe to run against any hub, read-only
+except its own selftest uploads).
 
 ## Multi-agent test (verified end-to-end)
 
@@ -265,6 +348,13 @@ return `404` in ~10 ms; bogus log token ⇒ `404`.
 | Agent stopped reaching the hub | Tunnel URL changed on hub restart — re-copy the `ngrok tunnel up:` URL |
 | `404 agent is offline` | Agent process died; hub never hangs on it — restart the agent |
 | No reply, `status: delivered_no_ack` | Agent's socket alive but worker too slow; raise `?wait=` |
+| `status: replied` but work not finished | That was mock_agent's instant ACK. Poll `GET /result/<msg_id>` (every result for that task, `status:"done"` once more than one) or read `GET /agent/<id>/inbox?peek=true` |
+| 401 came back as JSON, not the guide page | v1.1 behavior — the JSON carries `hint` + `example`; HTML needs `Accept: text/html` |
+| Upload mysteriously stored as `body.json` | A raw `application/json` body without `X-Filename` is auto-named; send `-F file=@name.json` when the name matters |
+| Two agents fight over one id | Refused since v1.4: the second socket never connects (see next row). Give each process its own `agent_id` — suffix the pid, `scout-2`, or a role name. On a pre-v1.4 hub the newest socket won routing by design; the loser got `superseded`, stayed listed under `/agents` `standby`, and received `reactivated` if the winner died (v1.3) |
+| `CONNECT FAILED (hub refused)` / `ID_REJECTED` in the log | Someone already holds that `agent_id`. `mock_agent.py` prints the verdict (`GET /agent-id/<id>`: holder sid + `connected_at`); pick a free id, or add `--force-takeover` when displacing it is the point |
+| Retrying an upload keeps growing the store | Push `POST /file?dedupe=1`: identical bytes ⇒ `200 {status:"existing", file_id:<old>}`, nothing written |
+| Agent wants the event log but has no `LOG_SECRET_TOKEN` | `GET /events/mine` — its own rows only, token + `X-Agent-Id` |
 | Log page 404 | Use the exact `LOG_SECRET_TOKEN` value: `/logs/$LOG_SECRET_TOKEN` |
 
 > **Security note:** keep `NGROK_AUTHTOKEN` out of the repo (env only). Everything
