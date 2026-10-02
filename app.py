@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Agent Hub - Flask + Flask-SocketIO orchestrator that routes messages and
 files between HTTP clients and AI agents stuck behind NAT (persistent
-outbound socket). Run:  NAUTH=... AGENT_AUTH_TOKEN=... LOG_SECRET_TOKEN=... python3 app.py"""
+outbound socket). Run:  NAUTH=... AGENT_AUTH_TOKEN=... LOG_SECRET_TOKEN=... python3 app.py
+Optional: NGROK_AUTHTOKEN=... opens a public HTTPS tunnel from inside this app;
+without it the hub warns and serves localhost only."""
 
 import hashlib
 import html as html_mod
@@ -29,6 +31,7 @@ AGENT_TOKEN = os.environ.get("AGENT_AUTH_TOKEN", "")     # agents' public token 
 LOG_SECRET = os.environ.get("LOG_SECRET_TOKEN", "")      # secret path segment for /logs/<token>
 HUB_PORT = int(os.environ.get("HUB_PORT", "5000"))
 ACK_TIMEOUT = float(os.environ.get("ACK_TIMEOUT", "10"))
+NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")  # optional: public tunnel, else localhost only
 
 ALLOWED_EXT = (".json", ".txt", ".html", ".htm", ".tar.gz", ".tgz")
 MAX_UPLOAD = 25 * 1024 * 1024
@@ -158,10 +161,12 @@ table{width:100%;border-collapse:collapse;font-size:12.5px}
 td,th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 </style></head><body><main>
 <h1>Agent Hub <span class="mut">/ NAT orchestrator</span></h1>
-<p>This central Flask server sits on a public URL (via an ngrok HTTPS tunnel) and keeps
+<p>This central Flask server keeps
 <span class="k">persistent outbound connections</span> open for AI agents trapped behind NAT.
 Clients POST tasks here; the hub routes them down the agent's socket by <code>agent_id</code>
-and streams replies and files back. No agent needs an inbound port.</p>
+and streams replies and files back. No agent needs an inbound port. Set
+<code>NGROK_AUTHTOKEN</code> and the hub opens its own public HTTPS tunnel; without it it
+stays on localhost and just warns.</p>
 
 <h2>How it works</h2>
 <div class="card"><ol style="margin:0;padding-left:20px">
@@ -183,10 +188,10 @@ and streams replies and files back. No agent needs an inbound port.</p>
 <pre>export NAUTH=your-master-token          # 1+ chars, client auth
 export AGENT_AUTH_TOKEN=agentpub12      # 6-50 chars, agent socket auth
 export LOG_SECRET_TOKEN=oplogs77x       # secret path for the log viewer
-python3 app.py                          # listens on :5000
+export NGROK_AUTHTOKEN=&lt;your-authtoken&gt;   # optional: opens the public tunnel in-app
+python3 app.py                          # listens on :5000 (+ tunnel when the token is set)
 
-# expose with ngrok (one tunnel):
-ngrok http 5000
+# no NGROK_AUTHTOKEN? the hub warns and stays on http://localhost:5000 only
 
 # client sends a task:
 curl -s -X POST $HUB/agent/scout/message \\
@@ -536,6 +541,39 @@ def server_error(exc):  # never crash a client into a hang
     return jsonify(error="internal server error", detail=str(exc)), 500
 
 
+# ----------------------------------------------------------------- public tunnel (optional)
+def _warn_localhost(reason: str) -> None:
+    msg = f"{reason} - no tunnel, serving localhost only on http://localhost:{HUB_PORT}"
+    print(f"[agent-hub] WARN: {msg}")
+    log_event("SERVER", "-", "Server -> Server", msg)
+
+
+def open_tunnel() -> None:
+    """Best effort: expose this hub over an ngrok HTTPS edge. Any problem (no token,
+    package missing, network down) only warns - the hub keeps serving on localhost."""
+    if not NGROK_AUTHTOKEN:
+        _warn_localhost("NGROK_AUTHTOKEN not set (export it to publish the hub)")
+        return
+    try:
+        import ngrok
+    except ImportError:
+        _warn_localhost("ngrok package missing (pip install ngrok)")
+        return
+    try:
+        ngrok.set_auth_token(NGROK_AUTHTOKEN)
+        listener = ngrok.forward(f"localhost:{HUB_PORT}", proto="http")
+    except Exception as exc:  # noqa: BLE001 - tunnel failure must not kill the hub
+        # ngrok echoes the authtoken back in its error text, keep it out of the log page
+        detail = str(exc).replace(NGROK_AUTHTOKEN, "<redacted>")
+        _warn_localhost(f"ngrok tunnel failed: {type(exc).__name__}: {detail}")
+        return
+    url = listener.url()
+    print(f"[agent-hub] ngrok tunnel up: {url}")
+    print(f"[agent-hub]   agents:  python3 mock_agent.py --server {url} --agent-id <id> --token \"$AGENT_AUTH_TOKEN\"")
+    print(f"[agent-hub]   clients: send header  ngrok-skip-browser-warning: true  on every request")
+    log_event("SERVER", "-", "Server -> ngrok edge", f"public {url} -> :{HUB_PORT}")
+
+
 # ----------------------------------------------------------------- main
 if __name__ == "__main__":
     init_log_file()
@@ -543,4 +581,5 @@ if __name__ == "__main__":
     print(f"[agent-hub] listening on :{HUB_PORT} | agents socket ns={NS} | "
           f"NAUTH len={len(NAUTH)} | agent token len={len(AGENT_TOKEN)} | "
           f"log page = /logs/{LOG_SECRET[:3]}***")
+    threading.Thread(target=open_tunnel, daemon=True).start()
     socketio.run(app, host="0.0.0.0", port=HUB_PORT, debug=False, allow_unsafe_werkzeug=True)
