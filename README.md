@@ -64,6 +64,9 @@ export AGENT_AUTH_TOKEN='changeme-agentshared'
 export LOG_SECRET_TOKEN='changeme-secretlogpath'
 export NGROK_AUTHTOKEN='<your-ngrok-authtoken>'   # optional: omit => warns, serves localhost only
 python3 app.py
+```
+
+```
 HUB=https://<your-id>.ngrok-free.app              # the hub prints "ngrok tunnel up: <url>"
 
 # 2. agents (anywhere behind NAT, outbound only) — see "Running an agent client through the tunnel"
