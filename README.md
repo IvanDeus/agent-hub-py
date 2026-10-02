@@ -3,19 +3,12 @@
 A lightweight Python central server that bridges HTTP clients and multiple AI agents stuck
 behind NAT. Agents make **outbound-only** persistent Socket.IO connections to the hub;
 clients POST tasks by `agent_id`, and the hub routes messages and files
-(JSON / TXT / TAR.GZ / HTML) both ways. Set `NGROK_AUTHTOKEN` and the hub opens its own
+(JSON / TXT / TAR.GZ / HTML) both ways. 
+
+Set `NGROK_AUTHTOKEN` and the hub opens its own
 **ngrok** tunnel through the `ngrok` SDK (`import ngrok`) and serves HTTPS — no port
 forwarding, no inbound firewall holes, no second process. Without that token it warns and
 serves on `localhost` only.
-
-```
-                    ┌───────────────┐  ngrok HTTPS tunnel  ┌──────────────┐
- client (curl/API) ─┤               │◀────────────────────▶│   ngrok edge  │
-                    │  Flask hub    │        :5000         └──────────────┘
- agent A  ◀──persistent Socket.IO (/agents)───  :  :
- agent B  ◀──(outbound from behind NAT)───────┤  hub ──▶ routes by agent_id,
- agent C  ◀───────────────────────────────────┘         stores files, logs all
-```
 
 ## Features
 
