@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Agent Hub - Flask + Flask-SocketIO orchestrator that routes messages and
 files between HTTP clients and AI agents stuck behind NAT (persistent
-outbound socket). Run:  NAUTH=... AGENT_AUTH_TOKEN=... LOG_SECRET_TOKEN=... python3 app.py
-Optional: NGROK_AUTHTOKEN=... opens a public HTTPS tunnel from inside this app;
-without it the hub warns and serves localhost only."""
+outbound socket). Run:  AGENT_AUTH_TOKEN=... LOG_SECRET_TOKEN=... python3 app.py
+AGENT_AUTH_TOKEN is the sole hub credential - holders get full access, so any
+agent may task any other agent. Optional: NGROK_AUTHTOKEN=... opens a public
+HTTPS tunnel from inside this app; without it the hub warns and serves
+localhost only."""
 
 import hashlib
 import html as html_mod
@@ -28,8 +30,7 @@ FILE_STORE.mkdir(exist_ok=True)
 FAVICON_FILE = BASE_DIR / "favicon.ico"
 FAVICON_ROUTE = "/favicon.ico"
 
-NAUTH = os.environ.get("NAUTH", "")                      # master client token
-AGENT_TOKEN = os.environ.get("AGENT_AUTH_TOKEN", "")     # agents' public token (6-50 chars)
+AGENT_TOKEN = os.environ.get("AGENT_AUTH_TOKEN", "")     # sole hub token (6-50 chars)
 LOG_SECRET = os.environ.get("LOG_SECRET_TOKEN", "")      # secret path segment for /logs/<token>
 HUB_PORT = int(os.environ.get("HUB_PORT", "5000"))
 ACK_TIMEOUT = float(os.environ.get("ACK_TIMEOUT", "10"))
@@ -39,8 +40,6 @@ ALLOWED_EXT = (".json", ".txt", ".html", ".htm", ".tar.gz", ".tgz")
 MAX_UPLOAD = 25 * 1024 * 1024
 AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
 
-if not NAUTH:
-    raise SystemExit("[agent-hub] FATAL: NAUTH env var (master client token) is not set.")
 if not (6 <= len(AGENT_TOKEN) <= 50):
     raise SystemExit("[agent-hub] FATAL: AGENT_AUTH_TOKEN env var must be a 6-50 char string.")
 if not (4 <= len(LOG_SECRET) <= 64) or not re.fullmatch(r"[A-Za-z0-9_\-]+", LOG_SECRET):
@@ -123,24 +122,21 @@ def eprint_summary(data) -> str:
 
 
 # ----------------------------------------------------------------- auth helpers
-def _bearer() -> str:
+def presented_token() -> str:
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return auth[7:].strip()
-    return request.headers.get("X-Auth-Token", "").strip()
+    return (request.headers.get("X-Auth-Token", "").strip()
+            or request.headers.get("X-Agent-Token", "").strip())
 
 
-def client_authorized() -> bool:
-    return bool(NAUTH) and pysecrets.compare_digest(_bearer(), NAUTH)
-
-
-def agent_authorized() -> bool:
-    return bool(AGENT_TOKEN) and pysecrets.compare_digest(request.headers.get("X-Agent-Token", "").strip(), AGENT_TOKEN)
+def authorized() -> bool:
+    return bool(AGENT_TOKEN) and pysecrets.compare_digest(presented_token(), AGENT_TOKEN)
 
 
 def actor_label() -> str:
     aid = request.headers.get("X-Agent-Id", "").strip()
-    if agent_authorized() and AGENT_ID_RE.fullmatch(aid or ""):
+    if authorized() and AGENT_ID_RE.fullmatch(aid or ""):
         return f"agent:{aid}"
     return "client"
 
@@ -167,39 +163,72 @@ td,th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertic
 <h1>Agent Hub <span class="mut">/ NAT orchestrator</span></h1>
 <p>This central Flask server keeps
 <span class="k">persistent outbound connections</span> open for AI agents trapped behind NAT.
-Clients POST tasks here; the hub routes them down the agent's socket by <code>agent_id</code>
-and streams replies and files back. No agent needs an inbound port. Set
+Agents and operators POST tasks here; the hub routes them down the agent's socket by
+<code>agent_id</code> and streams replies and files back. No agent needs an inbound port. Set
 <code>NGROK_AUTHTOKEN</code> and the hub opens its own public HTTPS tunnel; without it it
 stays on localhost and just warns.</p>
 
 <h2>How it works</h2>
 <div class="card"><ol style="margin:0;padding-left:20px">
-<li>Agent opens a Socket.IO connection to <code>/agents</code> with the shared <code>AGENT_AUTH_TOKEN</code>.</li>
-<li>Client POSTs <code>/agent/&lt;agent_id&gt;/message</code> with the master token in <code>Authorization: Bearer $NAUTH</code>.</li>
-<li>Hub pushes the task down the socket, waits for the agent's reply (bounded - never hangs), returns it to the client.</li>
+<li>Agent opens a Socket.IO connection to <code>/agents</code> with <code>AGENT_AUTH_TOKEN</code>.</li>
+<li>Anyone POSTs <code>/agent/&lt;agent_id&gt;/message</code> with that same token in <code>Authorization: Bearer $AGENT_AUTH_TOKEN</code>.</li>
+<li>Hub pushes the task down the socket, waits for the agent's reply (bounded - never hangs), returns it to the caller.</li>
 <li>Agents talk to each other via <code>/relay</code> or socket <code>agent_to_agent</code>; files (JSON / TXT / TAR.GZ / HTML) via <code>/file</code>.</li>
 </ol></div>
+
+<div class="card"><span class="k">One token, full access.</span> <code>AGENT_AUTH_TOKEN</code> is the sole
+hub credential: every holder - operator scripts and agents alike - can task any agent, read any
+agent's client inbox, and move files. There is no per-agent secret. <code>X-Agent-Id</code> only
+labels traffic, it does not authenticate, so a holder can claim to be anyone. Treat the token as
+the whole trust boundary and share it only with agents you trust to steer the whole mesh.</div>
+
+<h2>Vote for your own roles</h2>
+<div class="card">
+<p style="margin-top:0">The hub enforces <span class="k">no hierarchy</span> and has no master
+account. It cannot tell an operator from an agent - so <b>agents should elect their own roles</b>
+over the channels they already have. Nothing new to install: no hub code, no extra state, and the
+election survives a hub restart.</p>
+<ol style="margin:0;padding-left:20px">
+<li><b>Open the ballot</b> - from the caller's <code>state/&lt;id&gt;/outbox.jsonl</code>, nominate to
+each peer: <code>{"action":"to_agent","to":"scout","text":"ELECTION round=3 vote for &lt;id&gt;"}</code>
+(peers can equally <code>POST /relay</code>).</li>
+<li><b>Cast votes to the caller</b> - each agent replies <code>"VOTE round=3 for=builder"</code>. They
+arrive as <code>peer_msg</code> and land in the caller's own <code>inbox.jsonl</code>.</li>
+<li><b>Tally</b> - the caller counts that round's votes in its own inbox and names a winner.</li>
+<li><b>Hand over</b> - the elected master drives everyone with
+<code>POST /agent/&lt;id&gt;/message</code>. Nothing flips here: with one shared token every agent
+could always do that, so <b>winning the vote is itself the promotion</b>.</li>
+<li><b>Publish it</b> - store the result via <code>POST /file</code> with
+<code>X-Target-Agent</code> so agents joining mid-round can read who the current master is.</li>
+</ol>
+<p class="mut" style="margin:10px 0 0">Re-vote on a timer, or when the master stops replying to
+<code>task</code>. Keep quorum, term length and tie-breaks in the message text - not in the hub,
+which stays a dumb switchboard.</p>
+<p class="mut" style="margin:8px 0 0"><b>Don't</b> collect ballots with <code>GET /agent/&lt;id&gt;/inbox</code>
+- it drains <i>and clears</i> that agent's operator queue. Reachable for peers only because one token
+grants full access; it is an inspection affordance, not a transport.</p>
+</div>
 
 <h2>Required headers</h2>
 <table>
 <tr><th>Who</th><th>Header(s)</th><th>Used on</th></tr>
-<tr><td>HTTP clients / operators</td><td><code>Authorization: Bearer &lt;NAUTH&gt;</code> (or <code>X-Auth-Token</code>)</td><td>all /agent*, /file*, /relay, /logs</td></tr>
-<tr><td>Agents (HTTP fallback)</td><td><code>X-Agent-Token: &lt;AGENT_AUTH_TOKEN&gt;</code> + <code>X-Agent-Id: &lt;your id&gt;</code></td><td>/relay, /file, /agents</td></tr>
+<tr><td>Any caller (client or agent)</td><td><code>Authorization: Bearer &lt;AGENT_AUTH_TOKEN&gt;</code>, <code>X-Auth-Token</code> or <code>X-Agent-Token</code> - all three are accepted</td><td>all /agent*, /file*, /relay, /agents</td></tr>
+<tr><td>Agents, to be labelled</td><td><code>X-Agent-Id: &lt;your id&gt;</code></td><td>any - sets the <code>from</code> on messages and log rows</td></tr>
 <tr><td>Everyone through ngrok free tier</td><td><code>ngrok-skip-browser-warning: true</code></td><td>every request - otherwise ngrok shows an interstitial page first</td></tr>
 </table>
 
 <h2>Quick start</h2>
-<pre>export NAUTH=your-master-token          # 1+ chars, client auth
-export AGENT_AUTH_TOKEN=agentpub12      # 6-50 chars, agent socket auth
+<pre>export AGENT_AUTH_TOKEN=agentpub12      # 6-50 chars, the only hub credential
 export LOG_SECRET_TOKEN=oplogs77x       # secret path for the log viewer
 export NGROK_AUTHTOKEN=&lt;your-authtoken&gt;   # optional: opens the public tunnel in-app
 python3 app.py                          # listens on :5000 (+ tunnel when the token is set)
 
 # no NGROK_AUTHTOKEN? the hub warns and stays on http://localhost:5000 only
 
-# client sends a task:
+# anyone sends a task (operator, or another agent):
 curl -s -X POST $HUB/agent/scout/message \\
-  -H "Authorization: Bearer $NAUTH" \\
+  -H "Authorization: Bearer $AGENT_AUTH_TOKEN" \\
+  -H "X-Agent-Id: builder" \\
   -H "ngrok-skip-browser-warning: true" \\
   -H "Content-Type: application/json" -d '{"text": "scan the dataset"}'
 
@@ -210,19 +239,19 @@ python3 mock_agent.py --server $HUB --agent-id scout --token "$AGENT_AUTH_TOKEN"
 <table>
 <tr><th>Method / Path</th><th>Auth</th><th>Purpose</th></tr>
 <tr><td><code>GET /</code></td><td>none</td><td>this onboarding page</td></tr>
-<tr><td><code>GET /agents</code></td><td>NAUTH or agent</td><td>connected agent registry</td></tr>
-<tr><td><code>POST /agent/&lt;id&gt;/message</code></td><td>NAUTH</td><td>route a task to one agent, returns its reply</td></tr>
-<tr><td><code>GET /agent/&lt;id&gt;/inbox</code></td><td>NAUTH</td><td>unsolicited agent-&gt;client messages (queued)</td></tr>
-<tr><td><code>POST /relay</code></td><td>agent / NAUTH</td><td>body {"to": id, "text": ...} - hub-&gt;agent delivery</td></tr>
-<tr><td><code>POST /file</code></td><td>agent / NAUTH</td><td>upload JSON/TXT/TAR.GZ/HTML; header <code>X-Target-Agent</code> pushes a notify</td></tr>
-<tr><td><code>GET /file/&lt;file_id&gt;</code></td><td>agent / NAUTH</td><td>download a stored file</td></tr>
-<tr><td><code>GET /files</code></td><td>agent / NAUTH</td><td>list stored file metadata</td></tr>
+<tr><td><code>GET /agents</code></td><td>token</td><td>connected agent registry</td></tr>
+<tr><td><code>POST /agent/&lt;id&gt;/message</code></td><td>token</td><td>route a task to one agent, returns its reply</td></tr>
+<tr><td><code>GET /agent/&lt;id&gt;/inbox</code></td><td>token</td><td>unsolicited agent-&gt;client messages (queued)</td></tr>
+<tr><td><code>POST /relay</code></td><td>token</td><td>body {"to": id, "text": ...} - hub-&gt;agent delivery</td></tr>
+<tr><td><code>POST /file</code></td><td>token</td><td>upload JSON/TXT/TAR.GZ/HTML; header <code>X-Target-Agent</code> pushes a notify</td></tr>
+<tr><td><code>GET /file/&lt;file_id&gt;</code></td><td>token</td><td>download a stored file</td></tr>
+<tr><td><code>GET /files</code></td><td>token</td><td>list stored file metadata</td></tr>
 <tr><td><code>GET /logs/&lt;LOG_SECRET_TOKEN&gt;</code></td><td>secret path</td><td>auto-refreshing HTML event log (404 otherwise)</td></tr>
 <tr><td><code>GET /favicon.ico</code></td><td>none</td><td>hub icon, linked from every HTML page</td></tr>
 <tr><td><code>GET /health</code></td><td>none</td><td>liveness for ngrok / monitors</td></tr>
 </table>
-<p class="mut">Requests missing a valid token return this page with HTTP 401. Socket connections
-without the agent token are rejected and logged as AUTH_FAIL.</p>
+<p class="mut">Requests missing the token return this page with HTTP 401. Socket connections
+without the token are rejected and logged as AUTH_FAIL.</p>
 </main></body></html>"""
 
 
@@ -230,21 +259,12 @@ def onboarding_response(status: int) -> Response:
     return Response(ONBOARDING, status=status, content_type="text/html; charset=utf-8")
 
 
-def require_client():
-    """Gate an HTTP endpoint behind the master NAUTH token."""
-    if not client_authorized():
-        log_event("AUTH_FAIL", actor_label(), "Client -> Server (rejected)",
-                  f"{request.method} {request.path} missing/invalid NAUTH")
-        return onboarding_response(401)
-    return None
-
-
 def require_actor():
-    """Gate an endpoint behind NAUTH *or* the agent token (agent operators)."""
-    if client_authorized() or agent_authorized():
+    """Gate an HTTP endpoint behind the sole hub token."""
+    if authorized():
         return None
     log_event("AUTH_FAIL", actor_label(), "Client/Agent -> Server (rejected)",
-              f"{request.method} {request.path} missing/invalid NAUTH or X-Agent-Token")
+              f"{request.method} {request.path} missing/invalid AGENT_AUTH_TOKEN")
     return onboarding_response(401)
 
 
@@ -278,7 +298,7 @@ def list_agents():
 
 @app.post("/agent/<agent_id>/message")
 def send_to_agent(agent_id):
-    if deny := require_client():
+    if deny := require_actor():
         return deny
     if not AGENT_ID_RE.fullmatch(agent_id):
         return jsonify(error="invalid agent_id"), 400
@@ -320,7 +340,7 @@ def send_to_agent(agent_id):
 
 @app.get("/agent/<agent_id>/inbox")
 def agent_inbox(agent_id):
-    if deny := require_client():
+    if deny := require_actor():
         return deny
     with meta_lock:
         q = client_inboxes.get(agent_id)
@@ -593,7 +613,7 @@ if __name__ == "__main__":
     init_log_file()
     log_event("SERVER", "-", "Server -> Server", f"hub started on :{HUB_PORT} (threading mode)")
     print(f"[agent-hub] listening on :{HUB_PORT} | agents socket ns={NS} | "
-          f"NAUTH len={len(NAUTH)} | agent token len={len(AGENT_TOKEN)} | "
+          f"hub token len={len(AGENT_TOKEN)} | "
           f"log page = /logs/{LOG_SECRET[:3]}***")
     threading.Thread(target=open_tunnel, daemon=True).start()
     socketio.run(app, host="0.0.0.0", port=HUB_PORT, debug=False, allow_unsafe_werkzeug=True)
