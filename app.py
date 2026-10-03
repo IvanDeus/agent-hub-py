@@ -2,8 +2,9 @@
 """Agent Hub - Flask + Flask-SocketIO orchestrator that routes messages and
 files between HTTP clients and AI agents stuck behind NAT (persistent
 outbound socket). Run:  AGENT_AUTH_TOKEN=... LOG_SECRET_TOKEN=... python3 app.py
-AGENT_AUTH_TOKEN is the sole hub credential - holders get full access, so any
-agent may task any other agent. Optional: NGROK_AUTHTOKEN=... opens a public
+AGENT_AUTH_TOKEN is the operator credential - holders get full access, so any
+agent may task any other agent. Agents may instead use the scoped per-socket
+credential the hub pushes as `agent_token` (v1.5). Optional: NGROK_AUTHTOKEN=... opens a public
 HTTPS tunnel from inside this app (NGROK_DOMAIN=... pins a reserved free
 domain so the URL survives restarts); without a token the hub warns and serves
 localhost only. Agent-facing docs: GET /llms.txt (markdown) and GET /api
@@ -11,15 +12,17 @@ localhost only. Agent-facing docs: GET /llms.txt (markdown) and GET /api
 actionable hint unless the caller asks for HTML."""
 
 import hashlib
+import hmac as hmac_mod
 import html as html_mod
 import json
+import mimetypes
 import os
 import re
 import secrets as pysecrets
 import threading
 import time
 from collections import OrderedDict, defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, request, send_file
@@ -43,17 +46,33 @@ LOG_SECRET = os.environ.get("LOG_SECRET_TOKEN", "")      # secret path segment f
 HUB_PORT = int(os.environ.get("HUB_PORT", "5000"))
 HUB_BIND = os.environ.get("HUB_BIND", "127.0.0.1")  # local only; publish behind nginx or ngrok
 ACK_TIMEOUT = float(os.environ.get("ACK_TIMEOUT", "10"))
+# How long a delivered task may sit with no result at all before the hub calls it dead. Set well
+# above the HTTP wait budget (60s max) so a slow agent is not executed by a impatient caller.
+TASK_TTL_SECONDS = max(30, int(os.environ.get("TASK_TTL_SECONDS", "900")))
+TASK_LEDGER_MAX = 500          # msg_ids kept in the ledger before the oldest is evicted
+DEAD_LETTER_MAX = 200
+# ----------------------------------------------------------------- principals (v1.5)
+# Each agent socket is handed a credential at connect:
+#   "<agent_id>.<epoch>.<HMAC(CRED_SECRET, "agent_id|epoch")>"
+# Only the epoch is kept server-side - one per live agent_id - so rotating it (reconnect,
+# take-over, disconnect) revokes whatever the old socket was given, with no token store to sweep.
+# The credential is what makes `from` a fact instead of a typed header.
+CRED_SECRET = os.environ.get("HUB_CRED_SECRET") or pysecrets.token_hex(16)
+# Set HUB_OPERATOR_HTTP=0 to demote the master token to a socket-connect secret only: then every
+# HTTP call must present a named agent credential, and one-shot curl has to go through an agent.
+OPERATOR_HTTP = os.environ.get("HUB_OPERATOR_HTTP", "1") == "1"
 NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")  # optional: public tunnel, else localhost only
 NGROK_DOMAIN = os.environ.get("NGROK_DOMAIN", "")        # optional: reserved ngrok domain (stable URL)
 HUB_DEBUG = os.environ.get("HUB_DEBUG", "") == "1"       # 500 responses include exception detail
 
-HUB_VERSION = "1.4.0"
+HUB_VERSION = "1.5.0"
 FEATURES = ["llms_txt", "api_manifest", "json_errors", "method_405", "inbox_peek",
             "agents_detail", "upload_sha256", "autojson_name", "file_index",
             "events_json", "ngrok_domain", "result_lookup", "events_mine",
             "client_source", "dedupe_uploads", "superseded_notice", "single_result_log_rows",
             "standby_takeover_chain", "result_inbox_status", "sid_scope_notes",
-            "unique_agent_ids"]
+            "unique_agent_ids", "task_ledger", "dead_letter_queue", "agent_last_seen",
+            "agent_credentials", "scoped_reads", "operator_principal"]
 STARTED_AT = time.time()
 
 ALLOWED_EXT = (".json", ".txt", ".html", ".htm", ".tar.gz", ".tgz")
@@ -75,12 +94,23 @@ socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 agents = {}                # agent_id -> sid
 sid_to_agent = {}          # sid -> agent_id
 agent_since = {}           # agent_id -> iso connect time
+agent_epoch = {}           # agent_id -> epoch half of the live socket's credential (v1.5)
 agent_superseded = {}      # agent_id -> iso of last socket take-over
 standby = defaultdict(dict)   # agent_id -> {sid: iso} sockets that lost a take-over but are still open
 id_rejects = OrderedDict()    # agent_id -> {at, holder, reason} last duplicate-id connect refusals
 reg_lock = threading.Lock()
-client_inboxes = defaultdict(lambda: deque(maxlen=200))   # agent_id -> agent->client msgs
-RESULTS = OrderedDict()    # msg_id -> {"agent": ..., "results": [...]} last 500 tasks
+INBOX_QUEUE_MAX = 200
+# Only the write paths below ever allocate a queue, and they key it on an agent_id that was
+# validated at connect - reads must use .get() so a probe cannot mint keys (see agent_inbox).
+client_inboxes = defaultdict(lambda: deque(maxlen=INBOX_QUEUE_MAX))   # agent_id -> agent->client msgs
+RESULTS = OrderedDict()    # msg_id -> task ledger row, created when the task is EMITTED (last 500)
+# The ledger used to be written only when an answer arrived, so a task an agent never replied to
+# left no trace anywhere and GET /result/<msg_id> answered 404 "unknown msg_id" while blaming the
+# eviction window. Rows now open at emit time and move through delivered -> acked -> answered, or
+# -> expired, and expired rows are also collected in DEAD_LETTER for one-call triage.
+DEAD_LETTER = deque(maxlen=DEAD_LETTER_MAX)   # {reason, msg_id, agent, from, delivered_at, ...}
+expired_total = 0
+agent_last_seen = {}       # agent_id -> iso, last traffic the hub saw FROM that agent's socket
 file_meta = {}             # file_id -> {name, path, type, size, sha256, by, created, created_iso}
 sha_index = {}             # sha256 -> newest file_id (advisory duplicate detection only)
 pending = {}               # msg_id -> {"event": Event, "replies": []}
@@ -110,6 +140,8 @@ header .sub{color:var(--muted);font-size:12px}
 .b-MSG_RCVD{background:#7c3aed}.b-AUTH_FAIL{background:#c2410c}.b-FILE_SENT{background:#0e7490}
 .b-FILE_RCVD{background:#0f766e}.b-MSG_FAIL{background:#52525b}.b-SERVER{background:#334155}
 .b-ID_REJECTED{background:#a16207}
+.b-TASK_EXPIRED{background:#9f1239}.b-SCOPE_DENY{background:#7c2d12}
+.b-CRED_MINTED{background:#4338ca}.b-CRED_FAIL{background:#be123c}
 .aid{font-weight:700}.dir{color:var(--muted);font-size:12px}.pl{flex:1;min-width:220px;word-break:break-word;color:var(--fg)}
 """
 
@@ -231,6 +263,72 @@ def eprint_summary(data) -> str:
     return text
 
 
+# ----------------------------------------------------------------- task ledger
+def stamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def note_agent_traffic(agent_id: str) -> None:
+    """Record that the hub just heard FROM this agent's socket. Never called with meta_lock
+    held: the hub does not nest reg_lock and meta_lock anywhere."""
+    if agent_id and agent_id != "?":
+        with reg_lock:
+            agent_last_seen[agent_id] = stamp()
+
+
+def dead_letter_put(entry: dict, reason: str) -> None:
+    """Caller must hold meta_lock: DEAD_LETTER is copied with list() on the read path, and
+    mutating a deque mid-copy from another thread raises RuntimeError."""
+    DEAD_LETTER.append({**entry, "reason": reason, "died": stamp()})
+
+
+def ledger_open(msg_id: str, agent_id: str, caller: str, text: str) -> None:
+    """Open a task's ledger row at emit time, whether or not anyone ever answers it."""
+    at = stamp()
+    entry = {"msg_id": msg_id, "agent": f"agent:{agent_id}", "hub_issued": True,
+             "from": caller, "task": (text or "")[:200],
+             "delivered_at": at,
+             "deadline_at": (datetime.now(timezone.utc)
+                             + timedelta(seconds=TASK_TTL_SECONDS)).isoformat(timespec="seconds"),
+             "results": [], "status": "delivered", "state": "delivered", "updated": at}
+    with meta_lock:
+        RESULTS[msg_id] = entry
+        while len(RESULTS) > TASK_LEDGER_MAX:
+            _, evicted = RESULTS.popitem(last=False)
+            if not evicted["results"]:
+                dead_letter_put(evicted, "evicted")
+
+
+def reap_expired_tasks() -> None:
+    """'Nobody answered' becomes a logged event the moment it becomes true, instead of an
+    absence an operator has to think to poll for."""
+    global expired_total
+    while True:
+        time.sleep(15)
+        dead = []
+        with meta_lock:
+            now = datetime.now(timezone.utc)
+            for entry in list(RESULTS.values()):
+                if entry["state"] != "delivered" or entry["results"]:
+                    continue
+                try:
+                    deadline = datetime.fromisoformat(entry["deadline_at"])
+                except (TypeError, ValueError):
+                    continue
+                if now < deadline:
+                    continue
+                entry["state"] = entry["status"] = "expired"
+                entry["updated"] = stamp()
+                dead.append(dict(entry))
+                dead_letter_put(entry, "expired")
+            expired_total += len(dead)
+        for entry in dead:
+            log_event("TASK_EXPIRED", entry["agent"].partition(":")[2],
+                      "Server -> Agent (task abandoned)",
+                      f"[{entry['msg_id']}] delivered {entry['delivered_at']}, no result ever "
+                      f"arrived within {TASK_TTL_SECONDS}s")
+
+
 # ----------------------------------------------------------------- auth helpers
 def presented_token() -> str:
     auth = request.headers.get("Authorization", "")
@@ -240,15 +338,90 @@ def presented_token() -> str:
             or request.headers.get("X-Agent-Token", "").strip())
 
 
+def cred_sign(agent_id: str, epoch: str) -> str:
+    return hmac_mod.new(CRED_SECRET.encode(), f"{agent_id}|{epoch}".encode(),
+                        hashlib.sha256).hexdigest()
+
+
+def token_eq(a: str, b: str) -> bool:
+    """Constant-time compare that cannot blow up on a caller: a latin-1 header value can be
+    non-ASCII, and secrets.compare_digest raises TypeError on that (a free 500)."""
+    return hmac_mod.compare_digest((a or "").encode("utf-8", "replace"),
+                                   (b or "").encode("utf-8", "replace"))
+
+
+def mint_credential(agent_id: str) -> str:
+    """Rotate the epoch and hand back the fresh credential. Called on every successful connect
+    and on every standby promotion, so nothing an older socket was given keeps working."""
+    epoch = pysecrets.token_urlsafe(12)
+    with reg_lock:
+        agent_epoch[agent_id] = epoch
+    return f"{agent_id}.{epoch}.{cred_sign(agent_id, epoch)}"
+
+
+def credential_agent(presented: str) -> str:
+    """The agent_id behind a credential, or "". Verified by recomputing the signature (no
+    credential table) and then requiring the epoch to still be the live one for that id."""
+    parts = (presented or "").split(".")
+    if len(parts) != 3 or not all(parts):
+        return ""
+    agent_id, epoch, sig = parts
+    if not AGENT_ID_RE.fullmatch(agent_id):
+        return ""
+    if not token_eq(cred_sign(agent_id, epoch), sig):
+        return ""
+    with reg_lock:
+        live = agent_epoch.get(agent_id)
+    return agent_id if live == epoch else ""
+
+
+def principal() -> tuple:
+    """Who this HTTP call came FROM, decided by which credential authenticated - never by
+    X-Agent-Id, which any caller can type. ("operator", "") | ("agent", "<id>") | (None, None)."""
+    tok = presented_token()
+    if not tok:
+        return None, None
+    if AGENT_TOKEN and token_eq(tok, AGENT_TOKEN):
+        return ("operator", "") if OPERATOR_HTTP else (None, None)
+    who = credential_agent(tok)
+    if who:
+        return "agent", who
+    return None, None
+
+
 def authorized() -> bool:
-    return bool(AGENT_TOKEN) and pysecrets.compare_digest(presented_token(), AGENT_TOKEN)
+    return principal()[0] is not None
 
 
 def actor_label() -> str:
-    aid = request.headers.get("X-Agent-Id", "").strip()
-    if authorized() and AGENT_ID_RE.fullmatch(aid or ""):
-        return f"agent:{aid}"
+    kind, who = principal()
+    if kind == "agent":
+        return f"agent:{who}"          # from the credential; a header cannot override this
+    if kind == "operator":
+        label = request.headers.get("X-Agent-Id", "").strip()
+        return f"operator:{label}" if AGENT_ID_RE.fullmatch(label) else "operator"
     return "client"
+
+
+def own_agent() -> str:
+    """The agent_id this call is scoped to: the credential's own id, or "" for an operator
+    (the master token sees everything - that is what it is for)."""
+    kind, who = principal()
+    return who if kind == "agent" else ""
+
+
+def scope_violation(tried: str, what: str):
+    """403 when an agent reaches for another agent's thing. Returns None when allowed."""
+    mine = own_agent()
+    if not mine or mine == tried:
+        return None
+    log_event("SCOPE_DENY", mine, f"Agent:{mine} -> Server (refused)",
+              f"asked for {what} belonging to '{tried}' - credentials are per-agent")
+    return _err(403, f"this credential is '{mine}', it may not read {what} belonging to '{tried}'",
+                hint="agent credentials only cover their own agent_id (v1.5). Either connect as "
+                     f"'{tried}' to get its credential, or use the operator's AGENT_AUTH_TOKEN, "
+                     "which is intentionally all-seeing.",
+                your_agent_id=mine, asked_for=tried, what=what)
 
 
 # ----------------------------------------------------------------- error contract
@@ -274,7 +447,7 @@ API_ENDPOINTS = [
     {"method": "GET", "path": "/llms.txt", "auth": "none", "summary": "Plain-markdown API guide for LLM agents (text/markdown)."},
     {"method": "GET", "path": "/agents", "auth": "token",
      "summary": "Registry of connected agents.",
-     "returns": {"keys": ["agents (id->sid, stable shape)", "count", "agent_ids", "detail (id->{sid, connected_at, last_superseded_at, standby_sockets})", "standby (id->{sid: since})", "standby_note"]},
+     "returns": {"keys": ["agents (id->sid, stable shape)", "count", "agent_ids", "detail (id->{sid, connected_at, last_seen, last_superseded_at, standby_sockets, inbox_backlog, outstanding_tasks})", "standby (id->{sid: since})", "standby_note", "last_seen_note", "task_ledger (outstanding_by_agent, stranded, dead_letter, ttl_seconds, expiry_note, endpoint)", "stranded_note"]},
      "example": "curl -s $HUB/agents -H \"Authorization: Bearer $T\" -H \"ngrok-skip-browser-warning: true\""},
     {"method": "GET", "path": "/agent-id/{agent_id}", "auth": "token",
      "summary": "Pre-flight the v1.4 uniqueness rule: is this agent_id free, who holds it, when was it last refused.",
@@ -284,35 +457,43 @@ API_ENDPOINTS = [
     {"method": "POST", "path": "/agent/{agent_id}/message", "auth": "token",
      "summary": "Route a task to one agent; returns its first reply.",
      "body": {"text": "string"}, "query": {"wait": "reply budget seconds 0-60, default ACK_TIMEOUT"},
-     "returns": {"keys": ["status", "msg_id", "agent_id", "reply"]},
-     "note": "status 'replied' = first result received - with mock_agent that is the instant ACK, not completion; the real answer lands on GET /agent/{id}/inbox.",
+     "returns": {"keys": ["status", "msg_id", "agent_id", "reply", "task_state", "result_endpoint", "expires_at (only when not replied)", "watch", "note", "warning"]},
+     "note": "status 'replied' = first result received - with mock_agent that is the instant ACK, not completion; the real answer lands on GET /agent/{id}/inbox. Every POST opens a ledger row: follow it with GET /result/{msg_id}.",
      "errors": [400, 401, 404, 405],
      "example": "curl -s -X POST $HUB/agent/scout/message -H \"Authorization: Bearer $T\" -H \"X-Agent-Id: builder\" -H \"ngrok-skip-browser-warning: true\" -H \"Content-Type: application/json\" -d '{\"text\":\"scan the dataset\"}'"},
-    {"method": "GET", "path": "/agent/{agent_id}/inbox", "auth": "token",
+    {"method": "GET", "path": "/agent/{agent_id}/inbox", "auth": "token|credential",
      "summary": "Unsolicited agent->client messages. DEFAULT DRAINS AND CLEARS the queue.",
      "query": {"peek": "1/true/yes = read without clearing"},
      "returns": {"keys": ["agent_id", "messages", "count", "drained", "queue_max", "agent_online"]},
-     "errors": [401]},
-    {"method": "GET", "path": "/result/{msg_id}", "auth": "token",
-     "summary": "Everything the hub recorded for one task msg_id - the correlation hook for two-phase replies (last 500 tasks).",
-     "returns": {"keys": ["msg_id", "agent", "results", "count", "status (first_result|done|answered_via_inbox)", "answered_via_inbox", "updated", "note"]},
-     "note": "results is the ordered list of every `result` the agent emitted for this msg_id, including answers that arrived after the POST already returned. Only the last 500 tasks (and only since the current hub process) are retained.",
-     "errors": [401, 404],
+     "note": "since v1.5 an agent credential may only read its OWN inbox; the operator token reads any (that is what it is for).",
+     "errors": [400, 401, 403]},
+    {"method": "GET", "path": "/result/{msg_id}", "auth": "token|credential",
+     "summary": "The ledger row for one task msg_id. The row opens when the hub EMITS the task, so a task nobody answered is readable, not missing.",
+     "returns": {"keys": ["msg_id", "agent", "from", "task", "delivered_at", "deadline_at", "results", "count", "state (delivered|acked|answered|expired)", "status (first_result|done|answered_via_inbox)", "answered_via_inbox", "late", "caller_outcome", "waited_seconds", "hub_issued", "seconds_until_expiry", "updated", "note"]},
+     "note": "results is the ordered list of every `result` the agent emitted for this msg_id, including answers that arrived after the POST already returned. 404 here means the msg_id was never issued by this process (or it restarted) - NOT that a task went unanswered. An agent credential reads only rows it owns (targeted at it, or answered by it); operators read all.",
+     "errors": [401, 403, 404],
      "example": "curl -s $HUB/result/c68e84affe12 -H \"Authorization: Bearer $T\" -H \"ngrok-skip-browser-warning: true\""},
+    {"method": "GET", "path": "/tasks/dead-letter", "auth": "token|credential",
+     "summary": "Triage: every task the hub delivered that produced nothing (expired or evicted), newest last, plus how many tasks are still waiting per agent.",
+     "query": {"limit": "1-200, default 50"},
+     "returns": {"keys": ["count", "tasks", "newest_last", "states", "ledger_rows", "scoped_to", "outstanding_by_agent", "expired_total", "ttl_seconds", "note"]},
+     "note": "An agent credential sees only its OWN dead rows and its own outstanding count (scoped_to names the filter); the operator token sees the whole mesh.",
+     "errors": [401],
+     "example": "curl -s $HUB/tasks/dead-letter -H \"Authorization: Bearer $T\" -H \"ngrok-skip-browser-warning: true\""},
     {"method": "POST", "path": "/relay", "auth": "token",
      "summary": "Deliver text to a connected agent as peer_msg (operators and agents alike).",
      "body": {"to": "agent_id", "text": "string"}, "errors": [400, 401, 404]},
     {"method": "POST", "path": "/file", "auth": "token",
      "summary": "Upload a file (<=25 MB): .json .txt .html .htm .tar.gz .tgz, ASCII names only.",
      "body": "multipart -F file=@report.json, or raw bytes + X-Filename header; a raw application/json body with no X-Filename is stored as body.json",
-     "headers": {"X-Target-Agent": "optional; pushes file_ready so the agent auto-pulls it"},
+     "headers": {"X-Target-Agent": "optional; pushes file_ready so the agent auto-pulls it, AND records it in shared_with - since v1.5 being addressed is what grants that agent the download"},
      "query": {"dedupe": "1/true/yes = if these exact bytes are already stored, reuse that file_id (HTTP 200, nothing written) instead of minting a new one"},
      "returns": {"keys": ["status (stored|existing)", "file_id", "name", "size", "sha256", "delivered", "target_error", "duplicate_of", "deduped", "bytes_stored", "download_url"]},
      "errors": [400, 401, 413, 415]},
-    {"method": "GET", "path": "/files", "auth": "token", "summary": "Stored file metadata table {file_id: {...}}; survives restarts via file_store/index.json."},
-    {"method": "GET", "path": "/file/{file_id}", "auth": "token", "summary": "Download stored bytes (as attachment).", "errors": [401, 404]},
-    {"method": "GET", "path": "/events/mine", "auth": "token",
-     "summary": "Structured event rows involving YOU (agent, source or target) - no log secret needed. Send X-Agent-Id.",
+    {"method": "GET", "path": "/files", "auth": "token|credential", "summary": "Stored file metadata table {file_id: {...}}; survives restarts via file_store/index.json. An agent credential sees only files it uploaded or that named it in X-Target-Agent (response then carries scoped_to)."},
+    {"method": "GET", "path": "/file/{file_id}", "auth": "token|credential", "summary": "Download stored bytes (as attachment).", "errors": [401, 403, 404]},
+    {"method": "GET", "path": "/events/mine", "auth": "token|credential",
+     "summary": "Structured event rows involving YOU (agent, source or target) - no log secret needed. With an agent credential the id comes from the credential; the operator token still passes X-Agent-Id.",
      "query": {"limit": "1-500, default 100"},
      "returns": {"keys": ["events", "count", "total_matching", "caller", "note"]},
      "errors": [400, 401],
@@ -333,16 +514,20 @@ SOCKET_CONTRACT = {
                   "force_takeover": "optional true/1/yes - displace the live socket holding this id"},
         "fallback": "query string ?token=...&agent_id=...(&force=1) also accepted",
         "wrong_token": "socket refused, hub logs AUTH_FAIL",
+        "credential": ("immediately after a successful connect the hub emits `agent_token` down "
+                       "your socket: your per-agent_id HTTP credential (v1.5). Send it as "
+                       "X-Agent-Token; mock_agent does this automatically"),
         "id_taken": ("since v1.4 a second live socket on the same agent_id is REFUSED with a "
                      "reason string (connect_error) and logged as ID_REJECTED - ids are unique; "
                      "use another id, or force_takeover to displace deliberately"),
     },
     "hub_to_agent": {
-        "task": {"msg_id": "str - echo it back in result", "from": "agent:<id> or client", "text": "str"},
-        "peer_msg": {"from": "str", "text": "str"},
-        "file_ready": {"file_id": "str", "url": "/file/<id>", "note": "plus full file meta (name, size, sha256, by, created)"},
-        "superseded": {"agent_id": "str", "reason": "str", "at": "iso", "sid": "your hub-registry sid", "sid_note": "str", "note": "sent to the OLD socket when another process registers the same agent_id; your own task/peer_msg traffic moves to the new socket from then on"},
-        "reactivated": {"agent_id": "str", "reason": "str", "sid": "your hub-registry sid (compare with sio.get_sid(namespace='/agents'), NOT sio.sid)", "at": "iso", "note": "sent to a standby socket when the process that superseded it disconnects - routing of that agent_id comes back to you automatically (v1.3)"},
+        "agent_token": {"agent_id": "str", "token": "<agent_id>.<epoch>.<hmac> - send it as X-Agent-Token on every HTTP call", "note": "arrives right after connect (v1.5). This is what identifies you to the hub: `from` on your traffic comes from it, not from X-Agent-Id. Revoked when this socket disconnects or another process takes over your agent_id; a reactivated standby socket is re-minted one"},
+        "task": {"msg_id": "str - echo it back in result", "from": "agent:<id> (credential) | operator[:<label>] | client", "text": "str"},
+        "peer_msg": {"from": "str - same rule: derived from the credential that sent it", "text": "str"},
+        "file_ready": {"file_id": "str", "url": "/file/<id>", "note": "plus full file meta (name, size, sha256, by, created, shared_with)"},
+        "superseded": {"agent_id": "str", "reason": "str", "at": "iso", "sid": "your hub-registry sid", "sid_note": "str", "note": "sent to the OLD socket when another process registers the same agent_id; your own task/peer_msg traffic moves to the new socket from then on - and so does your HTTP credential, which stops working"},
+        "reactivated": {"agent_id": "str", "reason": "str", "sid": "your hub-registry sid (compare with sio.get_sid(namespace='/agents'), NOT sio.sid)", "at": "iso", "note": "sent to a standby socket when the process that superseded it disconnects - routing of that agent_id comes back to you automatically (v1.3), followed by a freshly minted agent_token (v1.5)"},
     },
     "agent_to_hub": {
         "result": {"msg_id": "str (echo of task msg_id)", "text": "str", "note": "every result is recorded under msg_id - read them back with GET /result/<msg_id>"},
@@ -355,12 +540,15 @@ SOCKET_CONTRACT = {
 FOOTGUNS = [
     "GET /agent/<id>/inbox DRAINS AND CLEARS its queue (maxlen 200) by default. Poll with ?peek=true; drain only when you mean to consume.",
     "POST /agent/<id>/message returns the FIRST result the agent emits. mock_agent auto-ACKs instantly, so status 'replied' usually means 'received', not 'done'. Poll GET /result/<msg_id> (every result recorded against that msg_id) or read the inbox for the real answer.",
+    "A task is not the same as an answer. Since v1.5 every POST opens a ledger row immediately (state delivered) that becomes acked/answered when results land, or expired after TASK_TTL_SECONDS (default 900) if the agent took the task and went quiet. GET /tasks/dead-letter lists the dead ones and GET /agents shows per-agent outstanding_tasks + last_seen - that pair is how you spot a wedged agent whose socket is still open. Expired rows are kept: if the answer shows up late it still lands, tagged late=true. Caveat: only a row with NO result at all ever expires - a mock_agent-style instant ACK puts it at acked, where it can sit forever, because the hub cannot tell a task finished with one result from an agent that ACKed and wedged. Emit a second `result` for the msg_id (or agent_to_client tagged with it) to move it to answered.",
     "agent_id is unique since v1.4: a second socket connecting with a live id is REFUSED at connect (connect_error says who holds it, log row ID_REJECTED) - no more silent routing theft. Check GET /agent-id/<id> before you connect, give each process its own id (e.g. suffix the pid), and use auth force_takeover:true only when you mean to kick the current holder. A forced take-over still sends the loser `superseded`, keeps it as a standby, and hands routing back with `reactivated` if the winner dies (v1.3 chain).",
-    "agent_id is still not authenticated as an identity: X-Agent-Id only labels HTTP traffic, so the `from` on a task is whatever the caller typed. Uniqueness stops collisions, not impersonation.",
+    "X-Agent-Id is only a label, never a credential: since v1.5 an agent's own HTTP calls are authenticated by its minted credential, but a caller holding the operator token can put anything in that header. Uniqueness (v1.4) stops routing collisions, not impersonation - only a credential proves who you are.",
     "Pick ONE stable X-Agent-Id per caller and keep sending it (an operator should look like `client` or a fixed `operator` id on every row). Because the header is forgeable and optional, drifting labels - `operator`, `qoder-operator`, `selftest` - make mesh attribution unreadable for the agents on the other end; the hub cannot fix that for you.",
-    "The `from` on a task or peer_msg is only the label the caller put in X-Agent-Id - it is not evidence of who posted it (an agent can POST /agent/<id>/message with X-Agent-Id of anyone, including the target itself). Never make routing or trust decisions off that string.",
+    "The `from` on a task or peer_msg comes from the credential that authenticated (v1.5): an agent's minted credential yields `agent:<id>` and nothing else. An operator-token caller's X-Agent-Id is still a self-declared label and is not evidence of who posted it - which is exactly why those rows are written as `operator:<label>` instead of pretending to be an agent.",
+    "Two principals since v1.5. An agent credential reaches only its own inbox, task rows and files (anything else is 403 with `your_agent_id`). The master AGENT_AUTH_TOKEN is the operator principal and still sees everything - deliberately, so a human can curl the hub in one shot. Run with HUB_OPERATOR_HTTP=0 to force every HTTP call, operator included, through a named credential.",
+    "A credential is tied to one socket: it stops working the moment that socket disconnects, the agent_id is taken over, or the hub restarts (unless you pin HUB_CRED_SECRET). mock_agent re-mints automatically on reconnect and on `reactivated`; a hand-rolled client that cached its old token will just start seeing 401s.",
     "Hub sid fields (`superseded.sid`, `reactivated.sid`, /agents `agents[id]`) are /agents-namespace sids. python-socketio clients expose the transport sid as `sio.sid`, which will NEVER match - self-check with `sio.get_sid(namespace='/agents')`.",
-    "One token = full access. Anyone holding AGENT_AUTH_TOKEN can task any agent, drain any inbox and move any file; the hub cannot tell operators from agents.",
+    "AGENT_AUTH_TOKEN is still full access for whoever holds it - that is the operator seat. What changed in v1.5 is that agents no longer need it for HTTP: they present the credential their socket was minted, so the hub can tell operators from agents. Until every agent is on a client that does this, treat the master token as a shared root password and keep it off the wire where you can.",
     "ngrok free tier: send 'ngrok-skip-browser-warning: true' on every request or you get an HTML interstitial instead of JSON.",
     "ngrok free URLs change on every hub restart unless NGROK_DOMAIN pins a reserved domain.",
     "There is no file delete endpoint - the store grows forever; uploads persist across restarts via file_store/index.json (v1.1+). Re-uploading identical bytes mints a NEW id by default (response says duplicate_of); POST /file?dedupe=1 reuses the existing id instead.",
@@ -394,7 +582,8 @@ No agent needs an inbound port.</p>
 <a href="/api">/api</a> (JSON endpoint manifest + socket contract).</div>
 
 <h2>Quick start</h2>
-<div class="card"><pre># 0. one token guards EVERYTHING (env at hub startup; export AGENT_AUTH_TOKEN=$T below)
+<div class="card"><pre># 0. two principals (v1.5): AGENT_AUTH_TOKEN is the operator seat and sees everything;
+#    an agent instead uses the scoped credential the hub pushes down its socket (agent_token)
 # 1. an agent joins (outbound only, keeps a socket open):
 python3 mock_agent.py --server $HUB --agent-id scout --token "$AGENT_AUTH_TOKEN"
 
@@ -419,8 +608,9 @@ without an ngrok token it stays on localhost:5000 and warns.</p></div>
 <h2>Required headers</h2>
 <table>
 <tr><th>Who</th><th>Header(s)</th><th>Used on</th></tr>
-<tr><td>Any caller</td><td><code>Authorization: Bearer &lt;AGENT_AUTH_TOKEN&gt;</code> (or <code>X-Auth-Token</code> / <code>X-Agent-Token</code> - all accepted)</td><td>every <code>/agent*</code>, <code>/file*</code>, <code>/relay</code>, <code>/agents</code></td></tr>
-<tr><td>Agents, to be labelled</td><td><code>X-Agent-Id: &lt;your id&gt;</code></td><td>any - labels messages and log rows; it does NOT authenticate</td></tr>
+<tr><td>Operators (and any agent that has no credential yet)</td><td><code>Authorization: Bearer &lt;AGENT_AUTH_TOKEN&gt;</code> (or <code>X-Auth-Token</code> / <code>X-Agent-Token</code> - all accepted)</td><td>every <code>/agent*</code>, <code>/file*</code>, <code>/relay</code>, <code>/agents</code>, <code>/result*</code>, <code>/tasks/*</code> - full access, labelled <code>operator[:&lt;X-Agent-Id&gt;]</code></td></tr>
+<tr><td>Agents (v1.5, preferred)</td><td><code>X-Agent-Token: &lt;agent_token you were pushed&gt;</code></td><td>same calls, scoped to your own inbox / task rows / files; <code>from</code> becomes <code>agent:&lt;your id&gt;</code> and cannot be forged</td></tr>
+<tr><td>Callers, to be labelled</td><td><code>X-Agent-Id: &lt;your id&gt;</code></td><td>labels an operator's messages and log rows; it does NOT authenticate and never overrides a credential</td></tr>
 <tr><td>Everyone through ngrok free tier</td><td><code>ngrok-skip-browser-warning: true</code></td><td>every request - otherwise ngrok returns an interstitial HTML page</td></tr>
 </table>
 
@@ -433,8 +623,8 @@ without an ngrok token it stays on localhost:5000 and warns.</p></div>
 <h2>Errors</h2>
 <div class="card">Every error is JSON <code>{"error", "hint", "docs", "api", ...}</code> with a
 fix suggestion, unless the caller sends <code>Accept: text/html</code>. Codes:
-<code>401</code> missing/invalid token &middot; <code>400</code> bad shape/agent_id
-(pattern <code>[A-Za-z0-9_-]{1,40}</code>) &middot; <code>404</code> agent offline or unknown
+<code>401</code> missing/invalid token, or a credential whose socket died &middot; <code>400</code> bad shape/agent_id
+(pattern <code>[A-Za-z0-9_-]{1,40}</code>) &middot; <code>403</code> an agent credential reaching another agent's inbox/task/file (names <code>your_agent_id</code>) &middot; <code>404</code> agent offline or unknown
 file_id &middot; <code>405</code> wrong verb (valid methods listed) &middot; <code>413</code>
 over 25 MB &middot; <code>415</code> filetype rejected (shows the sanitized name it checked).</div>
 
@@ -444,10 +634,17 @@ over 25 MB &middot; <code>415</code> filetype rejected (shows the sanitized name
 </ul></div>
 
 <h2>Trust model</h2>
-<div class="card"><code>AGENT_AUTH_TOKEN</code> is the sole credential - any holder has full
-access to task agents, drain inboxes and move files. <code>X-Agent-Id</code> is a label, not an
-identity. Share the token only with agents you trust to steer the whole mesh. The hub is a
-switchboard: it enforces no hierarchy and knows no master.</div>
+<div class="card">Two principals since v1.5.
+<code>AGENT_AUTH_TOKEN</code> is the <b>operator</b> seat: any holder has full access to task
+agents, drain any inbox, read the whole ledger and move any file - share it only with who you trust
+to steer the whole mesh. An <b>agent</b> needs it only to connect; the hub then mints a scoped
+credential and pushes it down that socket as <code>agent_token</code>, and on HTTP that credential
+is the proof of who is calling: it reaches only its own inbox / task rows / files, it fixes the
+<code>from</code> label (so it cannot be forged), and it dies with the socket - disconnect,
+take-over or restart is revocation. <code>X-Agent-Id</code> remains a label, never an identity. Run
+with <code>HUB_OPERATOR_HTTP=0</code> if you would rather the master token not work over HTTP at
+all. The hub is still a switchboard: it enforces no hierarchy among agents - any agent may task any
+other.</div>
 
 <p class="mut">Socket.IO namespace <code>/agents</code>; full event payloads in <a href="/api">/api</a>
 under <code>socket</code>. Wrong socket token => refused + logged AUTH_FAIL.</p>
@@ -484,11 +681,17 @@ def _build_llms_md() -> str:
         "",
         "## Auth",
         "",
-        "One shared token guards the whole hub: `AGENT_AUTH_TOKEN` (6-50 chars), sent as"
-        " `Authorization: Bearer <T>` (also accepted: `X-Auth-Token`, `X-Agent-Token`)."
-        " `X-Agent-Id: <id>` labels your traffic but does NOT authenticate - any holder can"
-        " task any agent, drain any inbox, move any file.",
-        "Missing/invalid token => 401 JSON with a hint (HTML only if you `Accept: text/html`).",
+        "Two principals since v1.5. **Operator:** `AGENT_AUTH_TOKEN` (6-50 chars), sent as"
+        " `Authorization: Bearer <T>` (also accepted: `X-Auth-Token`, `X-Agent-Token`) - full"
+        " access, every row it produces is labeled `operator`. **Agent:** a credential the hub"
+        " mints when a socket connects and pushes down it as an `agent_token` event,"
+        " `<agent_id>.<epoch>.<hmac>` - put it in `X-Agent-Token`. That credential is what"
+        " proves who you are: `from` is taken from it, never from `X-Agent-Id`, and it only"
+        " reaches its own inbox / task rows / files. It goes dead when the socket disconnects"
+        " or another process takes over the id (the hub re-mints on both). Set"
+        " `HUB_OPERATOR_HTTP=0` to make the master token socket-connect only.",
+        "Missing/invalid credential => 401 JSON with a hint (HTML only if you"
+        " `Accept: text/html`). Reaching another agent's thing => 403 with `your_agent_id`.",
         "",
         "## Quickstart",
         "",
@@ -525,10 +728,13 @@ def _build_llms_md() -> str:
         "## Error contract",
         "",
         "Errors are JSON: `{\"error\", \"hint\", \"docs\", \"api\", ...}` - the hint names the fix.",
-        "`400` bad agent_id (pattern `[A-Za-z0-9_-]{1,40}`) or body shape &middot; `401` token"
-        " &middot; `404` agent offline (hint shows how to start one) or unknown file_id &middot;"
-        " `405` wrong verb &middot; `413` >25 MB &middot; `415` rejected filetype (echoes"
-        " `name_after_sanitize`) &middot; `500` internal (no details unless hub runs `HUB_DEBUG=1`).",
+        "`400` bad agent_id (pattern `[A-Za-z0-9_-]{1,40}`) or body shape · `401` token"
+        " missing, wrong, or a credential whose socket already died · `403` scope"
+        " violation (`your_agent_id` + `asked_for`, also logged as `SCOPE_DENY`) ·"
+        " `404` agent offline (hint shows how to start one) or a msg_id this hub never"
+        " issued · `405` wrong verb · `413` >25 MB · `415` rejected filetype"
+        " (echoes `name_after_sanitize`) · `500` internal (no details unless hub"
+        " runs `HUB_DEBUG=1`).",
         "",
         "## Gotchas",
         "",
@@ -544,11 +750,16 @@ def _build_llms_md() -> str:
         "",
         "## Hub env vars",
         "",
-        "`AGENT_AUTH_TOKEN` (req) &middot; `LOG_SECRET_TOKEN` (req) &middot; `HUB_PORT` (5000) &middot;"
-        " `HUB_BIND` (127.0.0.1 - the hub is local by default, publish it behind nginx or ngrok)"
-        " &middot; `ACK_TIMEOUT` (10s) &middot; `NGROK_AUTHTOKEN` (optional"
-        " public tunnel) &middot; `NGROK_DOMAIN` (pin reserved domain so URL survives restarts) &middot;"
-        " `HUB_FILE_STORE` / `HUB_LOG_FILE` (relocate state for tests) &middot; `HUB_DEBUG=1`."
+        "`AGENT_AUTH_TOKEN` (req, operator seat) · `LOG_SECRET_TOKEN` (req) ·"
+        " `HUB_PORT` (5000) · `HUB_BIND` (127.0.0.1 - the hub is local by default, publish"
+        " it behind nginx or ngrok)"
+        " · `ACK_TIMEOUT` (10s) · `TASK_TTL_SECONDS` (900, floor 30 - when an"
+        " unanswered task goes `expired` and lands in /tasks/dead-letter) ·"
+        " `HUB_CRED_SECRET` (pin it or every agent credential dies with a hub restart) ·"
+        " `HUB_OPERATOR_HTTP=0` (master token becomes socket-only: every HTTP caller needs a"
+        " named credential) · `NGROK_AUTHTOKEN` (optional"
+        " public tunnel) · `NGROK_DOMAIN` (pin reserved domain so URL survives restarts) ·"
+        " `HUB_FILE_STORE` / `HUB_LOG_FILE` (relocate state for tests) · `HUB_DEBUG=1`."
         " mock_agent honors `HUB_STATE_DIR`.",
         "",
         "Full JSON manifest: `GET /api`. Human docs: `GET /`.",
@@ -564,18 +775,34 @@ def onboarding_response(status: int) -> Response:
 
 
 def require_actor():
-    """Gate an HTTP endpoint behind the sole hub token. Returns None if allowed,
-    else a content-negotiated 401 (JSON for agents, onboarding HTML for browsers)."""
+    """Gate an HTTP endpoint behind a principal: an agent credential (minted at socket connect)
+    or the operator's AGENT_AUTH_TOKEN. Returns None if allowed, else a content-negotiated 401
+    (JSON for agents, onboarding HTML for browsers)."""
     if authorized():
         return None
+    master_only = (not OPERATOR_HTTP
+                   and token_eq(presented_token(), AGENT_TOKEN or ""))
     log_event("AUTH_FAIL", actor_label(), "Client/Agent -> Server (rejected)",
-              f"{request.method} {request.path} missing/invalid AGENT_AUTH_TOKEN")
+              f"{request.method} {request.path} "
+              + ("operator token not accepted over HTTP (HUB_OPERATOR_HTTP=0)"
+                 if master_only else "missing/invalid credential or AGENT_AUTH_TOKEN"))
     if wants_html():
         return onboarding_response(401)
-    return jsonify(error="missing or invalid AGENT_AUTH_TOKEN",
-                   hint='add -H "Authorization: Bearer <AGENT_AUTH_TOKEN>" (or X-Auth-Token / '
-                        'X-Agent-Token); through ngrok free tier also add '
-                        '-H "ngrok-skip-browser-warning: true"',
+    if master_only:
+        return jsonify(error="the master token is socket-connect only on this hub",
+                       hint="this hub runs with HUB_OPERATOR_HTTP=0: agents must present the "
+                            "credential the hub emits as `agent_token` right after connect, in "
+                            "X-Agent-Token. Start one: python3 mock_agent.py --server $HUB "
+                            "--agent-id <id> --token $AGENT_AUTH_TOKEN (it uses the credential "
+                            "automatically).",
+                       docs="/llms.txt", api="/api",
+                       method=request.method, path=request.path), 401
+    return jsonify(error="missing or invalid credential",
+                   hint='agents: send the X-Agent-Token credential the hub emitted at connect. '
+                        'operators: -H "Authorization: Bearer <AGENT_AUTH_TOKEN>" (X-Auth-Token / '
+                        'X-Agent-Token also accepted). A credential stops working when its socket '
+                        'disconnects or its agent_id is taken over - reconnect to get a fresh one. '
+                        'Through ngrok free tier also add -H "ngrok-skip-browser-warning: true"',
                    docs="/llms.txt", api="/api",
                    method=request.method, path=request.path,
                    example=f'curl -s -H "Authorization: Bearer $AGENT_AUTH_TOKEN" '
@@ -596,9 +823,20 @@ def api_manifest():
     return jsonify(version=HUB_VERSION, features=FEATURES,
                    base_url=f"{scheme}://{request.host}",
                    docs="/llms.txt",
-                   auth={"token_env": "AGENT_AUTH_TOKEN",
+                   auth={"env_token": "AGENT_AUTH_TOKEN",
                          "how": "Authorization: Bearer <T> | X-Auth-Token | X-Agent-Token",
-                         "model": "one shared token = full access; X-Agent-Id labels, never authenticates"},
+                         "principals": {
+                             "operator": "the AGENT_AUTH_TOKEN itself - full read/write, labels "
+                                         "rows 'operator' (or 'operator:<X-Agent-Id>'), and can be "
+                                         "turned off over HTTP with HUB_OPERATOR_HTTP=0",
+                             "agent": "a credential minted at socket connect and pushed down that "
+                                      "socket as `agent_token`: <agent_id>.<epoch>."
+                                      "<HMAC-sha256>. Sent in X-Agent-Token. Proves who the caller "
+                                      "is, scopes /result /files and inboxes to that agent_id, and "
+                                      "is revoked when the socket dies or the id is taken over"},
+                         "model": "since v1.5 identity comes from the credential that "
+                                  "authenticated, never from X-Agent-Id; a master-token caller's "
+                                  "X-Agent-Id is still a self-declared label"},
                    headers={"ngrok_free_tier": "send ngrok-skip-browser-warning: true on every request"},
                    endpoints=API_ENDPOINTS, socket=SOCKET_CONTRACT, footguns=FOOTGUNS)
 
@@ -635,16 +873,48 @@ def list_agents():
         snap = dict(agents)
         since = dict(agent_since)
         sup = dict(agent_superseded)
+        seen = dict(agent_last_seen)
         std = {aid: dict(s) for aid, s in standby.items() if s}
+    with meta_lock:
+        backlog = {aid: len(q) for aid, q in client_inboxes.items()}
+        outstanding: dict = {}
+        for entry in RESULTS.values():
+            if entry["state"] in ("delivered", "acked"):
+                aid = entry["agent"].partition(":")[2]
+                outstanding[aid] = outstanding.get(aid, 0) + 1
+        dead = len(DEAD_LETTER)
     return jsonify(agents=snap,                       # frozen shape: {id: sid}
                    count=len(snap), agent_ids=sorted(snap),
                    detail={aid: {"sid": sid, "connected_at": since.get(aid),
+                                 "last_seen": seen.get(aid),
                                  "last_superseded_at": sup.get(aid),
-                                 "standby_sockets": len(std.get(aid) or {})}
+                                 "standby_sockets": len(std.get(aid) or {}),
+                                 "inbox_backlog": backlog.get(aid, 0),
+                                 "outstanding_tasks": outstanding.get(aid, 0)}
                            for aid, sid in snap.items()},
                    standby=std,
                    standby_note="still-open sockets that lost an agent_id take-over; the most "
-                                "recent one reclaims routing when the holder disconnects")
+                                "recent one reclaims routing when the holder disconnects",
+                   last_seen_note="last traffic the hub saw FROM that agent's socket (connect, "
+                                  "result, agent_to_client or agent_to_agent). Being connected and "
+                                  "having a stale last_seen with outstanding_tasks > 0 is the "
+                                  "wedged-agent signature - the socket is up, the work is not.",
+                   task_ledger={"outstanding_by_agent": outstanding,
+                                "stranded": {aid: n for aid, n in outstanding.items()
+                                             if aid not in snap},
+                                "dead_letter": dead, "ttl_seconds": TASK_TTL_SECONDS,
+                                "expiry_note": "outstanding counts rows in state delivered or "
+                                               "acked. Only a delivered row that never got a "
+                                               "single result goes expired (and dead-lettered) at "
+                                               "ttl_seconds; an acked row can sit there forever, "
+                                               "because the hub cannot tell a task the agent "
+                                               "finished with one result from one that only "
+                                               "auto-ACKed and then wedged. Read last_seen next to "
+                                               "outstanding_tasks, not the ttl, for that case.",
+                                "endpoint": "/tasks/dead-letter"},
+                   stranded_note="tasks waiting on an agent that is not connected right now; one "
+                                 "with no result yet goes expired at ttl_seconds, an already-acked "
+                                 "one keeps its row until it is answered")
 
 
 @app.get("/agent-id/<agent_id>")
@@ -698,8 +968,11 @@ def send_to_agent(agent_id):
     pentry = {"event": threading.Event(), "replies": []}
     with meta_lock:
         pending[msg_id] = pentry
+    caller = actor_label()
+    # Ledger first, then the socket: a task the agent swallows whole is still on the record.
+    ledger_open(msg_id, agent_id, caller, text)
 
-    socketio.emit("task", {"msg_id": msg_id, "from": actor_label(), "text": text},
+    socketio.emit("task", {"msg_id": msg_id, "from": caller, "text": text},
                   to=sid, namespace=NS)
     log_event("MSG_SENT", agent_id, "Client -> Server -> Agent",
               f"[{msg_id}] {eprint_summary(text)}")
@@ -718,10 +991,22 @@ def send_to_agent(agent_id):
         status = "delivered_no_ack"
     with meta_lock:
         pending.pop(msg_id, None)
-    out = {"status": status, "msg_id": msg_id, "agent_id": agent_id, "reply": reply}
+        row = RESULTS.get(msg_id)
+        if row is not None:
+            row["caller_outcome"] = status
+            row["waited_seconds"] = wait
+        state = (row or {}).get("state", "delivered")
+        deadline = (row or {}).get("deadline_at")
+    out = {"status": status, "msg_id": msg_id, "agent_id": agent_id, "reply": reply,
+           "task_state": state, "result_endpoint": f"/result/{msg_id}"}
     if status == "replied":
         out["note"] = ("first result only - mock_agent auto-ACKs here; the agent's real answer "
                        "arrives later on GET /agent/%s/inbox?peek=true" % agent_id)
+    else:
+        out["expires_at"] = deadline
+        out["watch"] = (f"GET /result/{msg_id} tracks this task: state goes delivered -> acked "
+                        f"-> answered, or -> expired after {TASK_TTL_SECONDS}s with nothing "
+                        f"to show for it; abandoned tasks overall: GET /tasks/dead-letter")
     if warning:
         out["warning"] = warning
     return jsonify(out)
@@ -731,10 +1016,16 @@ def send_to_agent(agent_id):
 def agent_inbox(agent_id):
     if deny := require_actor():
         return deny
+    if not AGENT_ID_RE.fullmatch(agent_id):
+        return _err(400, "invalid agent_id",
+                    hint="agent_id must match [A-Za-z0-9_-]{1,40}",
+                    pattern="[A-Za-z0-9_-]{1,40}", agent_id=agent_id)
+    if deny := scope_violation(agent_id, "an inbox"):
+        return deny                          # draining someone else's queue is not an agent right
     peek = request.args.get("peek", "").lower() in ("1", "true", "yes")
     with meta_lock:
-        q = client_inboxes.get(agent_id)
-        msgs = list(q) if q else []
+        q = client_inboxes.get(agent_id)      # never client_inboxes[...]: an unknown id must
+        msgs = list(q) if q else []           # not allocate a queue that outlives the request
         existed = q is not None
         if q and not peek:
             q.clear()
@@ -742,13 +1033,14 @@ def agent_inbox(agent_id):
         online = agent_id in agents
     return jsonify(agent_id=agent_id, messages=msgs, count=len(msgs),
                    peek=peek, drained=(not peek) and existed,
-                   queue_max=client_inboxes[agent_id].maxlen, agent_online=online)
+                   queue_max=INBOX_QUEUE_MAX, agent_online=online)
 
 
 @app.get("/result/<msg_id>")
 def task_result(msg_id):
     """Correlation for two-phase replies: everything the hub recorded for a msg_id.
-    Answers that arrived after the HTTP call timed out still land here, tagged."""
+    A row exists from the moment the task is emitted, so 'nothing happened yet' and
+    'this msg_id was never issued' are different, separately stated answers."""
     if deny := require_actor():
         return deny
     with meta_lock:
@@ -756,15 +1048,74 @@ def task_result(msg_id):
         out = dict(r) if r else None
     if out is None:
         return _err(404, "unknown msg_id",
-                    hint="only the last 500 tasks are kept (older ones evicted, hub restarts "
-                         "clear them too); the reply also carries msg_id inside "
-                         "GET /agent/<id>/inbox entries", msg_id=msg_id, window=500)
+                    hint="this hub never issued that msg_id, or it restarted (the ledger lives "
+                         "in memory) or the row aged out of the last %d tasks. A task that WAS "
+                         "issued keeps its row here forever, going state 'expired' when nobody "
+                         "answers it - see GET /tasks/dead-letter for all of them at once."
+                         % TASK_LEDGER_MAX,
+                    msg_id=msg_id, window=TASK_LEDGER_MAX, ttl_seconds=TASK_TTL_SECONDS,
+                    dead_letter="/tasks/dead-letter")
+    owner = out.get("agent", "").partition(":")[2]
+    mine = own_agent()
+    if mine and mine not in (owner, (out.get("answered_by") or "").partition(":")[2]):
+        return scope_violation(owner or "?", "a task ledger row")
     out["status"] = "done" if len(out.get("results", [])) > 1 else out.get("status", "first_result")
     out["count"] = len(out.get("results", []))
-    out["note"] = ("status: first_result = one `result` seen | done = more than one | "
-                   "answered_via_inbox = the agent answered with agent_to_client (tagged with "
-                   "this msg_id) instead of emitting results")
+    if out.get("state") == "delivered":
+        try:
+            out["seconds_until_expiry"] = max(
+                0, int((datetime.fromisoformat(out["deadline_at"])
+                        - datetime.now(timezone.utc)).total_seconds()))
+        except (KeyError, TypeError, ValueError):
+            pass
+    out["note"] = ("state: delivered = emitted, no result yet | acked = one `result` seen | "
+                   "answered = more than one, or the agent replied via agent_to_client | "
+                   "expired = the deadline passed with no result at all (the agent took the task "
+                   "and went quiet; an answer arriving after that still lands here, tagged "
+                   "late=true). status is the legacy field: first_result|done|answered_via_inbox.")
     return jsonify(out)
+
+
+@app.get("/tasks/dead-letter")
+def tasks_dead_letter():
+    """Triage view: every task the hub delivered that produced nothing, why it is dead,
+    plus a live count of the tasks still waiting."""
+    if deny := require_actor():
+        return deny
+    with meta_lock:
+        rows = list(DEAD_LETTER)
+        states: dict = {}
+        outstanding: dict = {}
+        for entry in RESULTS.values():
+            states[entry["state"]] = states.get(entry["state"], 0) + 1
+            if entry["state"] in ("delivered", "acked"):
+                aid = entry["agent"].partition(":")[2]
+                outstanding[aid] = outstanding.get(aid, 0) + 1
+        ledger_rows = len(RESULTS)
+    mine = own_agent()
+    if mine:            # an agent credential sees its own dead tasks, not the whole mesh's
+        rows = [r for r in rows if r.get("agent") == f"agent:{mine}"]
+        states = {}
+        for r in rows:
+            states[r["state"]] = states.get(r["state"], 0) + 1
+        outstanding = {mine: outstanding[mine]} if mine in outstanding else {}
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), DEAD_LETTER_MAX))
+    except ValueError:
+        limit = 50
+    dead_note = (f"reason: expired = no result within ttl_seconds | evicted = the row was pushed "
+                 f"out of the {TASK_LEDGER_MAX}-task ledger before anything answered. A growing "
+                 f"outstanding_by_agent entry next to a connected agent is the wedged-agent "
+                 f"signature: the socket is up, the work is not.")
+    if mine:
+        dead_note += (f" Scoped to your agent '{mine}': states and expired_total describe only "
+                      f"your rows; the operator token sees every agent's rows.")
+    return jsonify(count=len(rows), tasks=rows[-limit:], newest_last=True,
+                   states=states, ledger_rows=ledger_rows, scoped_to=mine or "all agents",
+                   outstanding_by_agent=outstanding,
+                   expired_total=(sum(1 for r in rows if r.get("reason") == "expired")
+                                  if mine else expired_total),
+                   ttl_seconds=TASK_TTL_SECONDS, note=dead_note)
 
 
 @app.get("/events/mine")
@@ -773,7 +1124,8 @@ def events_mine():
     human log page needs a separate secret they usually don't have."""
     if deny := require_actor():
         return deny
-    aid = request.headers.get("X-Agent-Id", "").strip()
+    # a credential decides whose feed this is; the header is only believed for the operator token
+    aid = own_agent() or request.headers.get("X-Agent-Id", "").strip()
     if not AGENT_ID_RE.fullmatch(aid or ""):
         return _err(400, "X-Agent-Id header required (your agent id)",
                     pattern="[A-Za-z0-9_-]{1,40}")
@@ -859,6 +1211,19 @@ def _notify_target(file_id: str, meta: dict, target: str, sender: str):
     return False, f"target agent '{target}' is offline; file stored, no notify sent"
 
 
+def _record_shared(file_id: str, target: str) -> None:
+    """Dedupe path: reusing older bytes must still grant the new recipient a download."""
+    if not AGENT_ID_RE.fullmatch(target or ""):
+        return
+    with meta_lock:
+        m = file_meta.get(file_id)
+        if m is not None:
+            shared = m.setdefault("shared_with", [])
+            if target not in shared:
+                shared.append(target)
+            persist_file_index()
+
+
 @app.post("/file")
 def upload_file():
     if deny := require_actor():
@@ -868,7 +1233,11 @@ def upload_file():
         fs = request.files["file"]
         raw_name = fs.filename or "file.bin"
         data = fs.stream.read(MAX_UPLOAD + 1)
-        ctype = fs.mimetype or "application/octet-stream"
+        ctype = fs.mimetype or ""
+        if not ctype or ctype == "application/octet-stream":
+            # most clients post the part without a Content-Type; the extension is the
+            # only type signal there is, and it is validated below anyway
+            ctype = mimetypes.guess_type(raw_name)[0] or "application/octet-stream"
     else:
         raw_name = request.headers.get("X-Filename", "").strip()
         ctype = request.headers.get("Content-Type", "").split(";")[0].strip()
@@ -891,10 +1260,15 @@ def upload_file():
     sha = hashlib.sha256(data).hexdigest()
     file_id = pysecrets.token_hex(8)
     now_dt = datetime.now(timezone.utc)
+    target = request.headers.get("X-Target-Agent", "").strip()
     meta = {"name": name, "type": ctype, "size": len(data), "sha256": sha, "by": sender,
             "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "created_iso": now_dt.isoformat(timespec="seconds"),
             "created_epoch": int(now_dt.timestamp())}
+    if AGENT_ID_RE.fullmatch(target):
+        # v1.5 scoping: an upload is readable by whoever stored it and whoever it was addressed
+        # to. Addressing is the sharing event, so X-Target-Agent is not just a notification.
+        meta["shared_with"] = [target]
 
     dedupe = request.args.get("dedupe", "").lower() in ("1", "true", "yes")
     with meta_lock:
@@ -911,9 +1285,9 @@ def upload_file():
             sha_index[sha] = file_id
             persist_file_index()
 
-    target = request.headers.get("X-Target-Agent", "").strip()
     if reused:
         delivered, target_error = _notify_target(dup, reused, target, sender)
+        _record_shared(dup, target)
         log_event("FILE_SENT", target or "-", f"{sender} -> Server (deduped)",
                   f"{name} ({len(data)} B, sha={sha[:12]}) -> existing id {dup}, "
                   f"pushed={delivered}")
@@ -941,12 +1315,27 @@ def upload_file():
     return jsonify(out), 201
 
 
+def _file_visible(meta: dict, mine: str) -> bool:
+    """Agents see files they stored or that were addressed to them; operators see everything."""
+    if not mine:
+        return True
+    return meta.get("by") == f"agent:{mine}" or mine in (meta.get("shared_with") or [])
+
+
 @app.get("/files")
 def list_files():
     if deny := require_actor():
         return deny
+    mine = own_agent()
     with meta_lock:
-        return jsonify({"files": dict(file_meta), "count": len(file_meta)})
+        rows = dict(file_meta)
+    if mine:
+        rows = {fid: m for fid, m in rows.items() if _file_visible(m, mine)}
+        return jsonify(files=rows, count=len(rows), scoped_to=mine,
+                       scope_note="an agent credential lists only what it uploaded or what was "
+                                  "addressed to it via X-Target-Agent; the operator token lists "
+                                  "the whole store")
+    return jsonify(files=rows, count=len(rows))
 
 
 @app.get("/file/<file_id>")
@@ -957,6 +1346,10 @@ def download_file(file_id):
         meta = file_meta.get(file_id)
     if not meta:
         return _err(404, "unknown file_id", hint="list what exists: GET /files", file_id=file_id)
+    mine = own_agent()
+    if mine and not _file_visible(meta, mine):
+        return scope_violation(str(meta.get("by") or "?").partition(":")[2] or "?",
+                               "a stored file")
     path = FILE_STORE / f"{file_id}__{meta['name']}"
     if not path.exists():
         return _err(404, "file bytes missing from store",
@@ -1007,7 +1400,7 @@ def on_connect(auth=None):
     auth = auth or {}
     token = auth.get("token") or request.args.get("token", "")
     agent_id = (auth.get("agent_id") or request.args.get("agent_id", "")).strip()
-    if not (AGENT_TOKEN and pysecrets.compare_digest(str(token), AGENT_TOKEN)):
+    if not (AGENT_TOKEN and token_eq(str(token), AGENT_TOKEN)):
         log_event("AUTH_FAIL", agent_id or "-", "Agent -> Server (socket rejected)",
                   "missing/invalid AGENT_AUTH_TOKEN")
         return False
@@ -1041,6 +1434,7 @@ def on_connect(auth=None):
         agents[agent_id] = request.sid
         sid_to_agent[request.sid] = agent_id
         agent_since[agent_id] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        agent_last_seen[agent_id] = agent_since[agent_id]
         standby[agent_id].pop(request.sid, None)
         if old and old != request.sid:
             agent_superseded[agent_id] = agent_since[agent_id]
@@ -1060,6 +1454,30 @@ def on_connect(auth=None):
             pass
     log_event("CONNECTED", agent_id, "Agent -> Server (socket open)",
               f"sid={request.sid[:12]} transport={getattr(request, 'transport', '?')}")
+    # v1.5: hand this socket its own credential. Minting here also revokes whatever the socket
+    # it replaced (if any) was holding, because there is exactly one live epoch per agent_id.
+    deliver_credential(agent_id, request.sid)
+
+
+def deliver_credential(agent_id: str, sid: str) -> str:
+    """Mint a fresh credential for this agent_id and push it down the given socket."""
+    cred = mint_credential(agent_id)
+    try:
+        socketio.emit("agent_token",
+                      {"agent_id": agent_id, "token": cred,
+                       "note": "send this as X-Agent-Token on HTTP. It proves who you are, so "
+                               "`from` is taken from it rather than from your X-Agent-Id header. "
+                               "It dies when this socket disconnects or when another process "
+                               "takes over this agent_id."},
+                      to=sid, namespace=NS)
+        log_event("CRED_MINTED", agent_id, "Server -> Agent (credential pushed)",
+                  f"agent-scoped HTTP credential for '{agent_id}' sent to socket {sid} "
+                  f"(value never logged; it rotates with this socket)")
+    except Exception as exc:  # noqa: BLE001 - a socket that cannot hear it is not worth a 500
+        log_event("CRED_FAIL", agent_id, "Server -> Agent (credential push failed)",
+                  f"{type(exc).__name__}: {exc} - this agent has no credential and will keep "
+                  f"using the operator token for HTTP")
+    return cred
 
 
 @socketio.on("disconnect", namespace=NS)
@@ -1083,6 +1501,7 @@ def on_disconnect():
                     standby.pop(agent_id, None)
             else:
                 agent_superseded.pop(agent_id, None)
+                agent_epoch.pop(agent_id, None)   # nobody routes this id: its credential is dead
     if agent_id and promote:
         log_event("CONNECTED", agent_id, "Server -> Agent (re-registered standby socket)",
                   f"sid={promote[:12]} routing returned after the holder disconnected")
@@ -1097,6 +1516,9 @@ def on_disconnect():
                           to=promote, namespace=NS)
         except Exception:  # noqa: BLE001 - standby socket may have died concurrently
             pass
+        # its old credential was revoked the moment the winner took the id, so re-mint now
+        # that this socket routes the agent_id again
+        deliver_credential(agent_id, promote)
     elif agent_id:
         log_event("DISCONNECTED", agent_id, "Agent -> Server (socket closed)",
                   "persistent connection dropped; future requests to this agent return 404")
@@ -1111,13 +1533,24 @@ def on_result(data=None):
         if msg_id:
             r = RESULTS.get(msg_id)
             if r is None:
-                if len(RESULTS) >= 500:
-                    RESULTS.popitem(last=False)
+                # the agent answered under a msg_id this hub never issued (self-invented id, or a
+                # hub restart dropped the ledger) - record it rather than drop the reply
+                while len(RESULTS) >= TASK_LEDGER_MAX:
+                    _, evicted = RESULTS.popitem(last=False)
+                    if not evicted["results"]:
+                        dead_letter_put(evicted, "evicted")
                 r = RESULTS[msg_id] = {"agent": f"agent:{agent_id}", "msg_id": msg_id,
-                                       "results": [], "updated": None}
+                                       "hub_issued": False, "results": [], "updated": None,
+                                       "status": "first_result", "state": "acked"}
             r["results"].append({"from": f"agent:{agent_id}", "text": text})
             r["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            late = r["state"] == "expired"
+            r["state"] = "answered" if len(r["results"]) > 1 else "acked"
             r["status"] = "done" if len(r["results"]) > 1 else "first_result"
+            if late:
+                r["late"] = True          # arrived after the reaper had already called it dead
+            if r.get("agent") != f"agent:{agent_id}":
+                r["answered_by"] = f"agent:{agent_id}"   # someone else owns the target id
         p = pending.get(msg_id)
         http_will_log = False
         if p:
@@ -1132,6 +1565,7 @@ def on_result(data=None):
     if not http_will_log:
         log_event("MSG_RCVD", agent_id, "Agent -> Server (recorded, no HTTP waiter)",
                   f"[{msg_id}] {eprint_summary(text)}")
+    note_agent_traffic(agent_id)
 
 
 @socketio.on("agent_to_client", namespace=NS)
@@ -1141,17 +1575,20 @@ def on_agent_to_client(data=None):
         return
     msg_id = (data or {}).get("msg_id")
     text = (data or {}).get("text", "")
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    client_inboxes[agent_id].append({"from": f"agent:{agent_id}", "ts": stamp,
-                                     "msg_id": msg_id, "text": text})
-    if msg_id:  # agents that answer over this channel never emit `result`, so tag the task
-        with meta_lock:
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with meta_lock:   # every reader of client_inboxes copies it with list(); appends must be locked
+        client_inboxes[agent_id].append({"from": f"agent:{agent_id}", "ts": at,
+                                         "msg_id": msg_id, "text": text})
+        if msg_id:  # agents that answer over this channel never emit `result`, so tag the task
             r = RESULTS.get(str(msg_id))
             if r is not None:
                 r["answered_via_inbox"] = True
-                r["updated"] = stamp
+                r["updated"] = at
                 r["status"] = "answered_via_inbox"
+                if r["state"] != "expired":
+                    r["state"] = "answered"
     log_event("MSG_RCVD", agent_id, "Agent -> Server -> Client (queued)", eprint_summary(text))
+    note_agent_traffic(agent_id)
 
 
 @socketio.on("agent_to_agent", namespace=NS)
@@ -1168,6 +1605,7 @@ def on_agent_to_agent(data=None):
         return {"error": f"agent '{to}' offline"}
     socketio.emit("peer_msg", {"from": f"agent:{sender}", "text": text}, to=sid, namespace=NS)
     log_event("MSG_SENT", to, f"Agent:{sender} -> Server -> Agent:{to}", eprint_summary(text))
+    note_agent_traffic(sender)
     return {"status": "relayed", "to": to}
 
 
@@ -1308,7 +1746,9 @@ if __name__ == "__main__":
     init_log_file()
     load_file_index()
     log_event("SERVER", "-", "Server -> Server",
-              f"hub v{HUB_VERSION} started on {HUB_BIND}:{HUB_PORT} (threading mode)")
+              f"hub v{HUB_VERSION} started on {HUB_BIND}:{HUB_PORT} (threading mode), "
+              f"task ttl {TASK_TTL_SECONDS}s")
+    threading.Thread(target=reap_expired_tasks, daemon=True, name="task-reaper").start()
     print(f"[agent-hub] v{HUB_VERSION} listening on {HUB_BIND}:{HUB_PORT} | agents socket ns={NS} | "
           f"hub token len={len(AGENT_TOKEN)} | docs = /llms.txt")
     announce_log_urls()
