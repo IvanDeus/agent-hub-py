@@ -16,6 +16,19 @@ python3 mock_agent.py --upload out/report.html --to reviewer
 python3 mock_agent.py --download <file_id>
 python3 mock_agent.py --health ; python3 mock_agent.py --docs   # /health, /llms.txt
 
+# the minted credential, and how to call the hub WITHOUT the master token:
+#   at connect the hub pushes a per-agent credential down your socket. The client writes it to
+#   <state>/<agent-id>/credential.txt (0600) and deletes it when that socket dies, so a one-shot
+#   on the same box can present it instead of AGENT_AUTH_TOKEN - and the hub then records the
+#   call as agent:<id> rather than operator:<label>:
+python3 mock_agent.py --agent-id scout --use-credential --inbox scout --peek
+python3 mock_agent.py --agent-id scout --credential      # where mine lives + what the hub says
+#   one proving command, no headers to interpret: it presents the file and prints the hub's answer
+#     python3 mock_agent.py --server https://<host> --agent-id scout --credential
+#   "scoped_to": "scout" is the id the hub read off the CREDENTIAL (the master token, which is
+#   all-seeing, answers "all agents"). A credential is also scoped, so --inbox <peer> is 403.
+#   keep the credential off the filesystem entirely: --no-credential-file (env AGENT_CREDENTIAL_FILE=0)
+
 # the operator (you / a sub-agent) communicates with the hub using files:
 #   reads   -> <state>/<agent-id>/inbox.jsonl   (tasks, peer msgs, files)
 #   writes  -> <state>/<agent-id>/outbox.jsonl  (one JSON action per line):
@@ -32,6 +45,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import signal
 import sys
 import threading
 import time
@@ -44,6 +58,22 @@ import socketio
 
 STATE_ROOT = Path(os.environ.get("HUB_STATE_DIR")
                   or Path(__file__).resolve().parent / "state")
+
+# The credential the hub mints at connect is pushed down the socket and lives only in this
+# process's memory, so the operator - who is the one person allowed to use it - cannot see it.
+# Mirroring it into the state dir (already the shared IPC surface, already agent-scoped) makes it
+# usable by a one-shot call; --no-credential-file / AGENT_CREDENTIAL_FILE=0 keeps it off disk.
+CREDENTIAL_FILE_NAME = "credential.txt"
+CREDENTIAL_FILE_ENABLED = os.environ.get("AGENT_CREDENTIAL_FILE", "1").lower() not in (
+    "0", "false", "no")
+
+# Age out my own copies on the hub's clock: the hub prunes its file store, ledger and log rings
+# after HUB_RETENTION_DAYS (default 14), and without this the client side of the same
+# conversation grows forever on disk. AGENT_RETENTION_DAYS overrides this side alone; 0 keeps
+# everything.
+RETENTION_DAYS = max(0, int(os.environ.get("AGENT_RETENTION_DAYS",
+                                           os.environ.get("HUB_RETENTION_DAYS", "14"))))
+RETENTION_SWEEP_SECONDS = max(60, int(os.environ.get("AGENT_RETENTION_SWEEP_SECONDS", "3600")))
 
 # Keep retrying a dropped socket for this long before declaring the hub unreachable. Long
 # enough to ride out an ngrok edge flap or a hub restart, short enough that a permanently
@@ -134,7 +164,7 @@ def emit(r: "requests.Response") -> None:
 
 class Agent:
     def __init__(self, server: str, agent_id: str, token: str, quiet: bool = False,
-                 force: bool = False):
+                 force: bool = False, no_credential_file: bool = False):
         self.server, self.agent_id, self.token = server, agent_id, token
         self.force = force
         self.base = http_base(server)
@@ -143,6 +173,8 @@ class Agent:
         (self.state / "downloads").mkdir(parents=True, exist_ok=True)
         self.inbox = self.state / "inbox.jsonl"
         self.outbox = self.state / "outbox.jsonl"
+        self.cred_path = self.state / CREDENTIAL_FILE_NAME
+        self.share_credential = CREDENTIAL_FILE_ENABLED and not no_credential_file
         self.sio = socketio.Client(reconnection=True, reconnection_attempts=0,
                                    reconnection_delay=2, request_timeout=15)
         self.running = True
@@ -199,10 +231,115 @@ class Agent:
         else:
             self._log(f"[{now()}] no credential in the connect handshake - this hub predates "
                       f"v1.5, using the hub token for HTTP")
+        self._publish_credential()
+
+    # ---------------- credential handoff: the socket's credential, on disk for the operator
+    def _publish_credential(self) -> None:
+        if not self.share_credential:
+            return
+        if not self.agent_token:
+            self._revoke_credential("this hub mints none")
+            return
+        try:
+            # O_TRUNC + 0600 at create: the file is a credential, so it must never be group- or
+            # world-readable even briefly, and a leftover from another hub must not survive.
+            fd = os.open(self.cred_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(self.agent_token + "\n")
+            self._log(f"[{now()}]   credential mirrored to {self.cred_path} (0600) - one-shots on "
+                      f"this box can present it: --agent-id {self.agent_id} --use-credential")
+        except OSError as exc:
+            self._log(f"[{now()}]   credential NOT mirrored: {exc} (this process still holds it)")
+
+    def _revoke_credential(self, why: str) -> None:
+        if not self.share_credential or not self.cred_path.exists():
+            return
+        try:
+            current = self.cred_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            self._log(f"[{now()}]   credential file unreadable, leaving it: {exc}")
+            return
+        # A process that took over this agent_id has already published ITS credential to the same
+        # path. Only our own copy is dead with our socket; deleting the newer one would knock out
+        # a live credential that belongs to somebody else.
+        if current and current != self.agent_token:
+            self._log(f"[{now()}]   {self.cred_path} left in place - it holds a newer credential "
+                      f"than this socket's ({why})")
+            return
+        try:
+            self.cred_path.unlink()
+        except OSError as exc:
+            self._log(f"[{now()}]   credential file still on disk: {exc} - treat it as dead")
+            return
+        self.agent_token = ""
+        self._log(f"[{now()}]   {self.cred_path} deleted ({why}) - the hub revoked this "
+                  f"credential with its socket, so leaving the file would look like a live secret")
+
+    def read_credential(self) -> str:
+        """The credential this agent_id last minted, if one is on disk and still looks usable."""
+        try:
+            txt = self.cred_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        # "<agent_id>.<epoch>.<hmac>", and minted for THIS id: the state dir can outlive the run
+        # that wrote it, and presenting another agent's credential would be a scoping bug.
+        parts = txt.split(".")
+        if len(parts) != 3 or not all(parts) or parts[0] != self.agent_id:
+            return ""
+        return txt
 
     def _log(self, msg: str) -> None:
         if not self.quiet:
             print(msg, flush=True)
+
+    def prune_state(self) -> dict:
+        """Remove my own history older than RETENTION_DAYS: inbox rows and downloaded files.
+
+        outbox.jsonl is deliberately NOT touched - the watcher tracks its consumed prefix by
+        content, so rewriting that file makes already-run actions run a second time."""
+        report = {"inbox_removed": 0, "downloads_removed": 0, "bytes": 0}
+        if RETENTION_DAYS <= 0:
+            return report
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        if self.inbox.exists():
+            keep, dropped = [], 0
+            try:
+                lines = self.inbox.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                ts = ""
+                try:
+                    ts = str(json.loads(line).get("ts") or "")
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    age = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp()
+                except (ValueError, OSError):
+                    age = time.time()          # unparseable: keep it, never delete on a guess
+                if age < cutoff:
+                    dropped += 1
+                else:
+                    keep.append(line)
+            if dropped:
+                tmp = self.inbox.with_name(self.inbox.name + ".tmp")
+                try:
+                    tmp.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+                    os.replace(tmp, self.inbox)      # atomic: a torn inbox is a lost history
+                    report["inbox_removed"] = dropped
+                except OSError:
+                    pass
+        dl = self.state / "downloads"
+        if dl.is_dir():
+            for f in dl.iterdir():
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        report["bytes"] += f.stat().st_size
+                        f.unlink()
+                        report["downloads_removed"] += 1
+                except OSError:
+                    continue
+        return report
 
     def _write_inbox(self, entry: dict) -> None:
         entry = {"ts": now(), **entry}
@@ -217,8 +354,11 @@ class Agent:
             if ev == "task":
                 self._write_inbox({"type": "task", "from": data.get("from"),
                                    "msg_id": data.get("msg_id"), "text": data.get("text")})
-                # instant ack so client requests never hang; real work goes to outbox later
-                self.sio.emit("result", {"msg_id": data.get("msg_id"),
+                # instant ack so client requests never hang; real work goes to outbox later.
+                # kind="ack" is what tells the hub this is intent and not the answer: without it a
+                # task the agent finished in one result and a task it ACKed then wedged on are the
+                # same row, which is the trap awaiting_answer exists for.
+                self.sio.emit("result", {"msg_id": data.get("msg_id"), "kind": "ack",
                                          "text": f"ACK[{self.agent_id}] task received {now()}"},
                               namespace="/agents")
             elif ev == "peer_msg":
@@ -231,6 +371,7 @@ class Agent:
                 if ev == "superseded":
                     self._log(f"[{now()}] SUPERSEDED: agent_id '{self.agent_id}' was taken "
                               f"over by another socket ({data.get('reason', '-')})")
+                    self._revoke_credential("superseded - the hub revoked it")
                 else:
                     self._log(f"[{now()}] REACTIVATED: routing for '{self.agent_id}' is back "
                               f"with this process")
@@ -380,6 +521,23 @@ class Agent:
         auth = {"token": self.token, "agent_id": self.agent_id}
         if self.force:
             auth["force_takeover"] = True
+
+        # A supervisor's SIGTERM used to kill the process mid-socket, leaving the mirrored
+        # credential on disk after the hub had already revoked it. Stop through the same exit path
+        # Ctrl+C uses, so the file goes with the socket.
+        def _stopped(signum, _frame):
+            self._log(f"[{now()}] SIGNAL {signum}: stopping - socket closes and its credential "
+                      f"is revoked with it")
+            self.deliberate_stop = True      # a supervisor's stop is not a crash: exit 0
+            self.running = False
+
+        for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, _stopped)
+            except (OSError, ValueError):   # not this platform, or not the main thread
+                pass
         try:
             self.sio.connect(self.base, namespaces=["/agents"], auth=auth, wait_timeout=15,
                              headers=SOCKET_HEADERS)
@@ -393,16 +551,31 @@ class Agent:
             print(f"  - right now: {verdict}", file=sys.stderr)
             if "ALIVE" in verdict:      # only now is "who holds this id" a meaningful question
                 self._why_refused()
+            self._revoke_credential("no socket in this process ever opened")
             return 2
         self._log(f"[{now()}] agent '{self.agent_id}' listening | "
                   f"inbox={self.inbox} | outbox={self.outbox}")
         self._write_inbox({"type": "hello", "text": f"{self.agent_id} online via {self.base}"})
+        pr = self.prune_state()
+        if RETENTION_DAYS:
+            extra = (f" | startup pruned {pr['inbox_removed']} row(s), "
+                     f"{pr['downloads_removed']} download(s)") if any(pr.values()) else ""
+            self._log(f"[{now()}] retention: inbox rows and downloads older than "
+                      f"{RETENTION_DAYS}d age out every {RETENTION_SWEEP_SECONDS}s{extra}")
         threading.Thread(target=self._watch_outbox, daemon=True).start()
+        next_prune = time.time() + RETENTION_SWEEP_SECONDS
         try:
             down_since = None
             told = ""
             next_tell = 0.0
             while self.running:
+                if time.time() >= next_prune:
+                    next_prune = time.time() + RETENTION_SWEEP_SECONDS
+                    pr = self.prune_state()
+                    if any(pr.values()):
+                        self._log(f"[{now()}] RETAIN: pruned {pr['inbox_removed']} inbox row(s), "
+                                  f"{pr['downloads_removed']} download(s) "
+                                  f"({pr['bytes']} B) older than {RETENTION_DAYS}d")
                 if self.sio.connected:
                     down_since = None
                     told = ""
@@ -434,6 +607,9 @@ class Agent:
                 self.sio.disconnect()
             except Exception:  # noqa: BLE001 - already gone is fine here
                 pass
+        # The socket is gone on every path that reaches here, so the hub has revoked our
+        # credential - take the on-disk copy with it rather than leaving a dead one behind.
+        self._revoke_credential("this process is exiting")
         # Only a Ctrl+C is a clean exit. Ending any other way means the socket was lost for
         # good, and exit 0 would tell a supervisor "nothing to restart".
         return 0 if self.deliberate_stop else 1
@@ -463,20 +639,95 @@ def main() -> None:
     ap.add_argument("--force-takeover", action="store_true",
                     default=os.environ.get("HUB_FORCE_TAKEOVER", "").lower() in ("1", "true", "yes"),
                     help="take an agent_id that is already connected (hub refuses duplicates since v1.4)")
+    ap.add_argument("--credential", action="store_true",
+                    help="print where this agent_id's minted credential lives, and exit")
+    ap.add_argument("--use-credential", action="store_true",
+                    default=os.environ.get("AGENT_USE_CREDENTIAL", "").lower() in ("1", "true", "yes"),
+                    help="one-shot: present the credential minted for --agent-id (from its file) "
+                         "instead of the master token, so the hub labels the call agent:<id>")
+    ap.add_argument("--no-credential-file", action="store_true",
+                    help="never mirror the minted credential into the state dir (env AGENT_CREDENTIAL_FILE=0)")
     ap.add_argument("--check-id", metavar="AGENT_ID", help="GET /agent-id/<id> and exit (is it free?)")
     ap.add_argument("--health", action="store_true", help="GET /health and exit")
     ap.add_argument("--docs", action="store_true", help="GET /llms.txt and exit")
     args = ap.parse_args()
 
-    if not args.token:
-        ap.error("--token (AGENT_AUTH_TOKEN) is required")
     one_shot = any([args.message, args.inbox, args.relay_to, args.upload, args.download,
-                    args.agents, args.health, args.docs, args.check_id])
+                    args.agents, args.health, args.docs, args.check_id, args.credential])
+    if args.use_credential and not (args.agent_id and args.agent_id != "operator"):
+        ap.error("--use-credential needs the --agent-id whose credential to present "
+                 "(env AGENT_ID) - a credential belongs to one named agent")
+    if not args.token and not (args.use_credential or args.credential):
+        ap.error("--token (AGENT_AUTH_TOKEN) is required - or --use-credential to present an "
+                 "already-minted agent credential instead")
     if not args.agent_id:
         if not one_shot:
             ap.error("--agent-id is required for persistent mode (env: AGENT_ID)")
         args.agent_id = "operator"
-    agent = Agent(args.server, args.agent_id, args.token, force=args.force_takeover)
+    agent = Agent(args.server, args.agent_id, args.token, force=args.force_takeover,
+                  no_credential_file=args.no_credential_file)
+
+    if args.credential:
+        minted = agent.read_credential()
+        out = {
+            "agent_id": args.agent_id,
+            "hub": agent.base,
+            "credential_file": str(agent.cred_path),
+            "present_on_disk": bool(minted),
+            "written_by": "the persistent client, at connect; deleted when that socket dies",
+            "read_the_value": f"cat {agent.cred_path}",
+            "use_it": f"python3 mock_agent.py --server {args.server} --agent-id {args.agent_id} "
+                      f"--use-credential --inbox {args.agent_id} --peek",
+        }
+        if not minted:
+            out["proof"] = {"verdict": "nothing on disk to present - start the persistent client "
+                                       "and the hub mints one down that socket"}
+        else:
+            agent.agent_token = minted
+            # /tasks/dead-letter?limit=1 is the smallest call whose answer differs by principal:
+            # `scoped_to` is the id the hub read off the credential, while the master token is
+            # all-seeing and answers "all agents". Nothing about it needs a header to believe.
+            v = requests.get(f"{agent.base}/tasks/dead-letter", headers=agent._auth_headers(),
+                             params={"limit": 1}, timeout=20)
+            got = ""
+            try:
+                got = str(v.json().get("scoped_to") or "") if v.ok else ""
+            except ValueError:
+                got = ""
+            if got == args.agent_id:
+                verdict = (f"LIVE - the hub identified this caller as '{got}' from the credential "
+                           f"alone (the master token answers scoped_to='all agents')")
+            elif not v.ok:
+                verdict = (f"REFUSED ({v.status_code}) - the socket that minted it is gone and the "
+                           f"hub revoked the credential; have the agent reconnect")
+            else:
+                verdict = f"answered scoped_to='{got or '-'}', not '{args.agent_id}'"
+            out["proof"] = {"call": "GET /tasks/dead-letter?limit=1", "http": v.status_code,
+                            "scoped_to": got or None, "verdict": verdict}
+        print(json.dumps(out, indent=2, default=str))
+        return
+
+    if args.use_credential:
+        minted = agent.read_credential()
+        if not minted:
+            print(f"--use-credential: no usable credential for '{args.agent_id}' at "
+                  f"{agent.cred_path}\n"
+                  f"  - it is written when the agent connects: python3 mock_agent.py "
+                  f"--server {args.server} --agent-id {args.agent_id} --token \"$AGENT_AUTH_TOKEN\"\n"
+                  f"  - and deleted the moment that socket dies (the hub revokes it then too), "
+                  f"so a hub restart means the agent must reconnect first", file=sys.stderr)
+            sys.exit(3)
+        agent.agent_token = minted
+
+    def actor_note() -> None:
+        # A one-shot with the master token is recorded as operator:<label> even when this very box
+        # holds a credential that would record it as agent:<id> - say so instead of leaving the
+        # log full of unattributable rows.
+        if not args.use_credential and agent.share_credential and agent.cred_path.exists():
+            print(f"note: this call used the master token, so the hub recorded it as "
+                  f"'operator:{args.agent_id}'. A credential for '{args.agent_id}' is on disk at "
+                  f"{agent.cred_path} - --use-credential makes the same call land as "
+                  f"'agent:{args.agent_id}'")
 
     if args.docs:
         r = requests.get(f"{agent.base}/llms.txt", timeout=20)
@@ -505,6 +756,7 @@ def main() -> None:
                       f"lands later - check: python3 mock_agent.py --inbox {args.message} --peek")
         except ValueError:
             pass
+        actor_note()
         return
     if args.inbox:
         url = f"{agent.base}/agent/{args.inbox}/inbox"
@@ -517,6 +769,7 @@ def main() -> None:
     if args.relay_to:
         emit(requests.post(f"{agent.base}/relay", headers=agent._auth_headers(), timeout=20,
                            json={"to": args.relay_to, "text": args.text}))
+        actor_note()
         return
     if args.upload:
         p = Path(args.upload)
@@ -525,13 +778,16 @@ def main() -> None:
             headers["X-Target-Agent"] = args.to
         emit(requests.post(f"{agent.base}/file", headers=headers, timeout=60,
                            files={"file": file_part(p)}))
+        actor_note()
         return
     if args.download:
         r = requests.get(f"{agent.base}/file/{args.download}", headers=agent._auth_headers(),
                          timeout=60)
         if r.ok:
-            files = requests.get(f"{agent.base}/files", headers=agent._auth_headers(),
-                                 timeout=20).json().get("files", {})
+            # one row, not the whole store: an older hub ignores ids= and answers with the full
+            # table, which this still reads correctly - it just pays 134 KB to name one file.
+            files = requests.get(f"{agent.base}/files?ids={args.download}",
+                                 headers=agent._auth_headers(), timeout=20).json().get("files", {})
             meta = files.get(args.download, {})
             dest = agent.state / "downloads" / meta.get("name", f"{args.download}.bin")
             dest.write_bytes(r.content)
@@ -539,6 +795,7 @@ def main() -> None:
                   f"{hashlib.sha256(r.content).hexdigest() == meta.get('sha256')})")
         else:
             emit(r)
+        actor_note()
         return
     sys.exit(agent.run_forever())
 
