@@ -230,6 +230,46 @@ def main() -> int:
                     "peek"} <= set(ib) and ib.get("peek") is True and ib.get("drained") is False,
           r.text[:120])
 
+    # ---- v1.5: task ledger, dead-letter triage, two principals
+    dl = requests.get(f"{s}/tasks/dead-letter", timeout=T, headers=auth)
+    check("GET /tasks/dead-letter 200 + triage keys",
+          dl.ok and {"count", "tasks", "states", "ledger_rows", "outstanding_by_agent",
+                     "expired_total", "ttl_seconds", "newest_last"} <= set(dl.json()),
+          dl.text[:140])
+    ag = requests.get(f"{s}/agents", timeout=T, headers=auth)
+    agj = ag.json() if ag.ok else {}
+    det = agj.get("detail") or {}
+    check("GET /agents carries the v1.5 ledger summary",
+          ag.ok and {"task_ledger", "last_seen_note", "stranded_note"} <= set(agj)
+          and {"outstanding_by_agent", "stranded", "dead_letter", "ttl_seconds", "endpoint"}
+          <= set(agj.get("task_ledger") or {}), ag.text[:160])
+    if det:
+        check("agents detail carries last_seen + queue depth + outstanding tasks",
+              all({"last_seen", "inbox_backlog", "outstanding_tasks"} <= set(v)
+                  for v in det.values()), str(list(det.values())[:1])[:160])
+    check("GET /result/<never issued> 404 points at the ledger, not the eviction window",
+          requests.get(f"{s}/result/neverissued0", timeout=T, headers=auth).status_code == 404
+          and "/tasks/dead-letter" in requests.get(f"{s}/result/neverissued0",
+                                                   timeout=T, headers=auth).json().get("hint", ""),
+          "hint should name the dead-letter route")
+    badhdr = {"Accept": "application/json", "ngrok-skip-browser-warning": "true"}
+    for bad in ("not-a-credential", "agenta.shortepoch." + "0" * 64, "a.b.c"):
+        r = requests.get(f"{s}/agents", timeout=T, headers={**badhdr, "X-Agent-Token": bad})
+        check(f"bogus credential '{bad[:20]}' = 401", r.status_code == 401, r.text[:110])
+    a = manifest.get("auth") or {}
+    check("manifest documents both principals and the credential-derived model",
+          {"operator", "agent"} <= set(a.get("principals") or {})
+          and "credential" in str(a.get("model", "")), str(a)[:160])
+    h2 = requests.get(f"{s}/health", timeout=T).json()
+    check("health advertises the v1.5 features",
+          {"task_ledger", "dead_letter_queue", "agent_last_seen", "agent_credentials",
+           "scoped_reads", "operator_principal"} <= set(h2.get("features", [])),
+          str(h2.get("features"))[:160])
+    check("footguns cover credential-derived identity and the operator seat",
+          "credential that authenticated" in fg and "HUB_OPERATOR_HTTP=0" in fg, fg[:160])
+    check("socket contract documents the agent_token handshake",
+          "agent_token" in json.dumps(manifest.get("socket", {})), "missing agent_token")
+
     # ---- logs
     r = requests.get(f"{s}/logs/wrong-token-9x", timeout=T)
     check("logs wrong token = 404", r.status_code == 404)
@@ -273,6 +313,28 @@ def main() -> int:
                     if mid in e.get("payload", "") and e.get("event") == "MSG_RCVD"]
             check("one MSG_RCVD log row per result (no duplicates)",
                   len(rows) == 1, str(rows)[:200])
+        # v1.5: an emitted task is a ledger row even if nobody answers it, and the caller
+        # label comes from which credential authenticated
+        r = requests.post(f"{s}/agent/{args.agent}/message?wait=0", timeout=T, headers=auth,
+                          json={"text": "selftest ledger probe"})
+        led = r.json() if r.ok else {}
+        mid2 = led.get("msg_id", "")
+        check("POST wait=0 answers with the ledger handle",
+              r.ok and led.get("task_state") in ("delivered", "acked")
+              and led.get("result_endpoint") == f"/result/{mid2}", r.text[:160])
+        r = requests.get(f"{s}/result/{mid2}", timeout=T, headers=auth)
+        row = r.json() if r.ok else {}
+        check("the task is readable as a ledger row (state + deadline), not a 404",
+              r.ok and row.get("state") in ("delivered", "acked", "answered")
+              and row.get("deadline_at") and row.get("delivered_at")
+              and row.get("hub_issued") is True, r.text[:180])
+        check("an operator-token call is labeled operator, never agent",
+              str(row.get("from", "")).startswith("operator:"), str(row.get("from")))
+        r = requests.get(f"{s}/tasks/dead-letter", timeout=T, headers=auth)
+        dlj = r.json() if r.ok else {}
+        check("the waiting task shows up as outstanding for this agent",
+              dlj.get("outstanding_by_agent", {}).get(args.agent, 0) >= 1
+              or dlj.get("states", {}).get("answered", 0) >= 1, str(dlj)[:180])
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
