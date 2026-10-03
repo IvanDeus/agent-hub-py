@@ -21,19 +21,33 @@ serves on `localhost` only.
   (≤25 MB, SHA-256 checked). Upload with a target agent and it gets pushed a
   `file_ready` notice; the NAT agent auto-pulls the bytes over outbound HTTPS.
 - **Agent ↔ agent** — relay over socket (`agent_to_agent`) or plain HTTP (`/relay`).
-- **Auth** — a single hub token (`AGENT_AUTH_TOKEN`, 6–50 chars) plus a secret log path
-  (`LOG_SECRET_TOKEN`). Any holder gets full access: tasking any agent, draining any
-  inbox, moving files. Missing/invalid ⇒ `401` + onboarding page, agents rejected on
-  connect and logged as `AUTH_FAIL`.
+- **Auth — two principals** (v1.5). `AGENT_AUTH_TOKEN` (6–50 chars) is the **operator** seat:
+  whoever holds it sees everything (task any agent, drain any inbox, read the whole ledger).
+  An **agent** no longer needs that shared secret for HTTP: the hub mints a per-agent credential
+  (`<agent_id>.<epoch>.<HMAC-SHA256>`) and pushes it down the live socket as `agent_token`, and
+  that credential reaches only its own inbox, task rows and files — anything else is `403` with
+  `your_agent_id` named. `from` is derived from *which credential authenticated*, so an agent
+  cannot label itself as somebody else, and a credential dies with its socket (disconnect,
+  take-over, hub restart), which makes revocation free. Missing/invalid ⇒ `401` + onboarding
+  page; agents refused at connect and logged as `AUTH_FAIL`. Set `HUB_OPERATOR_HTTP=0` to make
+  the master token socket-only and force every HTTP call, operator included, through a named
+  credential.
 - **Agent-first surface** — the hub is designed for AI callers: unauthenticated
   `GET /llms.txt` (markdown API guide) and `GET /api` (JSON manifest incl. the socket
   contract); every error returns JSON with an actionable `hint` (HTML only when you
   `Accept: text/html`); capability discovery via `version` + `features` on `/health`;
   `GET /client.py` serves the reference agent client so a remote agent can fetch the code
   it needs in one call.
-- **Reply correlation** — `POST /agent/<id>/message` answers with the *first* `result`, so
-  `GET /result/<msg_id>` keeps every result recorded against that `msg_id` (last 500 tasks)
-  and reports `first_result` / `done` / `answered_via_inbox`.
+- **Reply correlation** — `POST /agent/<id>/message` answers with the *first* `result`, and
+  `GET /result/<msg_id>` keeps every result recorded against that `msg_id`, reporting
+  `first_result` / `done` / `answered_via_inbox`.
+- **Task ledger + dead-letter** (v1.5) — the hub opens a ledger row when it **emits** a task, not
+  when it hears back, so a task nobody answered is a readable row (`state`: `delivered` → `acked`
+  → `answered`, or `expired` once `TASK_TTL_SECONDS` passes) rather than a 404 that blames the
+  eviction window. Abandoned tasks collect in `GET /tasks/dead-letter` with a `reason`
+  (`expired` / `evicted`), and `GET /agents` carries `outstanding_tasks` + `last_seen` per agent —
+  that pair is how you spot a wedged agent whose socket is still open. An answer that arrives
+  after the deadline still lands, tagged `late: true`.
 - **No orphaned sockets** — losing an `agent_id` take-over sends the loser `superseded` and
   keeps it as a visible standby; when the winner disconnects it gets `reactivated` and its
   routing back instead of dying silently.
@@ -48,7 +62,7 @@ serves on `localhost` only.
   auto-scrolling dark/light page at `/logs/<LOG_SECRET_TOKEN>` (404 for any wrong
   token), colored
   badges: `CONNECTED` `DISCONNECTED` `MSG_SENT` `MSG_RCVD` `AUTH_FAIL` `ID_REJECTED`
-  `FILE_SENT` `FILE_RCVD` `MSG_FAIL`. Agents get their own slice without the log secret
+  `CRED_MINTED` `CRED_FAIL` `SCOPE_DENY` `TASK_EXPIRED` `FILE_SENT` `FILE_RCVD` `MSG_FAIL`. Agents get their own slice without the log secret
   via `GET /events/mine`; `?peek=true` makes inbox reads non-destructive; `?dedupe=1`
   makes re-uploading identical bytes a no-op; a stolen `agent_id` now sends the loser a
   `superseded` event instead of stealing traffic in silence. Startup prints the page as a
@@ -56,6 +70,38 @@ serves on `localhost` only.
 
 ## Changelog
 
+- **v1.5.0** — **a task now has a lifecycle, and an agent has an identity.** Both came out of the
+  same live-mesh review: two agents on the hub couldn't tell "the agent went quiet" from "the hub
+  lost the thread", and neither could tell who had actually posted what.
+  *Task ledger* (`task_ledger`, `dead_letter_queue`, `agent_last_seen`): `RESULTS` rows are opened
+  at **emit** time with a `deadline_at`, so `GET /result/<msg_id>` distinguishes
+  `delivered` / `acked` / `answered` from `expired` instead of answering 404 and blaming the
+  500-task window; `POST /agent/<id>/message` returns `task_state` + `result_endpoint`, the reaper
+  flips unanswered rows to `expired` and files them in `GET /tasks/dead-letter` with a `reason`,
+  an answer arriving after expiry is kept and tagged `late: true`, and `GET /agents` gained
+  `last_seen`, `inbox_backlog`, `outstanding_tasks` and a `task_ledger` summary.
+  *Two principals* (`agent_credentials`, `scoped_reads`, `operator_principal`): connecting agents
+  are handed a minted credential over the socket (`agent_token` event) and use it as
+  `X-Agent-Token`; `from` comes from **which credential authenticated** rather than from
+  `X-Agent-Id`, agent credentials only reach their own inbox / task rows / files (cross-agent reads
+  are `403` + `SCOPE_DENY` log rows; a file is shared by being named in `X-Target-Agent`),
+  rotation on reconnect / take-over / disconnect is revocation for free, and `HUB_OPERATOR_HTTP=0`
+  demotes the master token to socket-only. Nothing was renamed and no default flipped: an operator
+  holding `AGENT_AUTH_TOKEN` gets exactly the v1.4 access, and a client that ignores `agent_token`
+  keeps working — which is precisely why the master token is still a shared root password until
+  every agent is on a credential-aware client. Verified against `git show HEAD:app.py` running
+  side-by-side on isolated hubs (18 ledger checks incl. expiry + late answers, 29 principal checks
+  incl. forged `X-Agent-Id`, cross-agent reads and a correctly-signed-but-dead-epoch credential),
+  plus a 61-check `selftest.py` pass on the shipped build.
+  *Client resilience* (found by the peer agent on the mesh, after it shipped): the socket
+  handshake is an HTTP GET, so ngrok's free tier intercepts it and python-socketio reports the
+  HTML as a JSON parse error — and on a *reconnect* that exception dies inside engineio's thread
+  with no event at all, leaving a live-looking agent silent for the full give-up window.
+  `mock_agent.py` now sends `ngrok-skip-browser-warning` on the socket too, names the cause of a
+  non-JSON handshake, probes `/health` 10 s into any outage and prints the verdict (hub down vs
+  dead URL vs hub-alive-so-my-socket-is-the-problem), and installs a `threading.excepthook` so a
+  background socket failure becomes a log line. Hub-side behaviour unchanged, so agents written
+  against v1.0–v1.4 are unaffected — they just need to re-fetch `GET /client.py` to get it.
 - **v1.4.0** — **`agent_id` is now unique per live socket.** Before this, a second agent
   registering an id that was already connected quietly *became* that agent: the first one kept
   its socket open but stopped receiving traffic (v1.2 named the symptom `superseded`, v1.3 gave
@@ -112,18 +158,22 @@ no monkey-patching needed). The `ngrok` package is optional: if it is missing, o
 
 | Var | Purpose | Rules |
 |---|---|---|
-| `AGENT_AUTH_TOKEN` | Sole hub credential — socket connect **and** every HTTP op | required, 6–50 chars |
+| `AGENT_AUTH_TOKEN` | The **operator** credential — socket connect **and** every HTTP op (agents may use their minted credential instead) | required, 6–50 chars |
 | `LOG_SECRET_TOKEN` | Secret URL segment for the live log page `/logs/<token>` | required, 4–64 URL-safe chars |
 | `NGROK_AUTHTOKEN` | The hub opens its own ngrok tunnel with it (via `import ngrok`) | optional — unset ⇒ warns, localhost only |
 | `HUB_PORT` | Hub listen port | default `5000` |
 | `HUB_BIND` | Hub listen interface | default `127.0.0.1` — the hub is local-only; publish it behind nginx (see below) or ngrok |
 | `ACK_TIMEOUT` | Seconds the hub waits for an agent reply | default `10` |
+| `TASK_TTL_SECONDS` | How long a task may sit unanswered before its ledger row goes `expired` and lands in `/tasks/dead-letter` | default `900`, floored at `30` |
+| `HUB_CRED_SECRET` | HMAC key for agent credentials | optional — random per process, so **every credential dies with a hub restart**; pin it to keep credentials valid across restarts |
+| `HUB_OPERATOR_HTTP` | `0` refuses `AGENT_AUTH_TOKEN` on HTTP endpoints (socket-connect only) so every caller needs a named credential | default `1` — the operator seat stays one-token-anywhere |
 | `NGROK_DOMAIN` | Reserved ngrok domain passed to `ngrok.forward()` — the public URL survives restarts | optional — needs a domain claimed in the ngrok dashboard |
 | `HUB_FILE_STORE` / `HUB_LOG_FILE` | Relocate `file_store/` / `logs.html` (test isolation) | optional — default next to `app.py` |
 | `HUB_DEBUG` | `1` includes exception detail in 500 responses | optional — off by default (leaks internals) |
 
-The hub refuses to start if either token is missing/invalid. Tokens are
-compared with `secrets.compare_digest`; secrets never appear in logs.
+The hub refuses to start if either token is missing/invalid. Tokens are compared with
+`hmac.compare_digest` over UTF-8 bytes, so a non-ASCII header is a clean `401` and not a 500;
+secrets never appear in logs.
 
 ## Quick start
 1. start the hub — it opens its own ngrok tunnel when NGROK_AUTHTOKEN is set
@@ -226,6 +276,11 @@ export AGENT_AUTH_TOKEN='changeme-agentshared'        # must match the hub
 python3 mock_agent.py --server https://<your-id>.ngrok-free.app --agent-id scout --token "$AGENT_AUTH_TOKEN"
 ```
 
+That token is only needed to *connect*. On a v1.5 hub the agent is handed its own scoped credential
+down the socket a moment later and uses that for every HTTP call, so the shared secret stops
+travelling on every request (check the `CREDENTIAL issued for 'scout'` line, or the hub's
+`CRED_MINTED` log row, to confirm it landed).
+
 All three flags fall back to env vars, which is handier for a fleet of agents sharing one
 shell block (only `AGENT_ID` has to be unique — since v1.4 the hub *enforces* it, so a
 duplicate connect is refused rather than silently stealing traffic):
@@ -275,18 +330,38 @@ to `state/<agent-id>/inbox.jsonl` and acts on JSON lines appended to
   it into `HUB_URL` / `--server` after a restart, or claim a free static domain in the ngrok
   dashboard and set `NGROK_DOMAIN=<your-id>.ngrok.app` — the hub passes it to `ngrok.forward()`
   and the URL stops churning. `GET /health` echoes the live public URL in `public_url`.
+  An agent pointed at a stale one used to fail in silence: the socket handshake is a plain HTTP
+  GET, so ngrok answers it with **HTML**, python-socketio reports that as
+  `Expecting value: line 1 column 1`, and on a reconnect it dies inside engineio's own thread
+  where no event fires. `mock_agent.py` now sends `ngrok-skip-browser-warning: true` on the
+  socket as well as on HTTP, translates a non-JSON handshake into the cause, probes `/health`
+  10 s into any outage and prints what it got
+  (`SOCKET DOWN for 10s - https://… answered HTTP 404 - ngrok's dead-URL page; ask for the
+  current URL`), and routes background-thread failures into the log instead of Python's hook.
 - **Always use the `https://` URL**, never `http://localhost:5000`, on a machine that is not
   the hub. Localhost is only reachable there — and is all you get when `NGROK_AUTHTOKEN` is
   unset and the hub skipped the tunnel.
-- **One token, full access.** `AGENT_AUTH_TOKEN` authenticates operators *and* agents, so any
-  agent can task any other agent and drain any client inbox. `X-Agent-Id` only labels traffic
-  and is never validated — it is not a per-agent secret. A wrong token still reaches the tunnel
-  fine, then gets rejected at the socket and logged as `AUTH_FAIL`.
+- **The operator token is still full access — by design.** `AGENT_AUTH_TOKEN` authenticates the
+  socket *and* every HTTP op, so anyone holding it can task any agent and drain any inbox; that is
+  the operator seat, kept deliberately one-token-anywhere so a human can `curl` the hub without
+  ceremony. Since v1.5 agents have a cheaper option: the credential their socket was handed
+  (`agent_token` → send it as `X-Agent-Token`), which is scoped and expires with the socket. Until
+  every agent is on a credential-aware client, treat the master token as a shared root password —
+  and if you want the hub to *enforce* that, run it with `HUB_OPERATOR_HTTP=0` (HTTP then refuses
+  the master token; socket connect still takes it). A wrong token reaches the tunnel fine, then
+  gets rejected at the socket and logged as `AUTH_FAIL`.
 
 ## HTTP API
 
-All endpoints except `/` and `/health` require **`Authorization: Bearer <AGENT_AUTH_TOKEN>`**
-(or `X-Auth-Token` / `X-Agent-Token` — all three are accepted from any caller).
+Every endpoint except `/`, `/health`, `/llms.txt`, `/api` and the log pages needs a **principal**:
+either the operator token as **`Authorization: Bearer <AGENT_AUTH_TOKEN>`** (or `X-Auth-Token` /
+`X-Agent-Token` — all three are read), or, since v1.5, the **agent credential** the hub minted for
+that agent's socket, sent as `X-Agent-Token`. The hub records *which* one authenticated: an agent
+credential makes the caller `agent:<id>` and reaches only that agent's own inbox, task rows and
+files (anything else is `403` naming `your_agent_id`, logged as `SCOPE_DENY`), while the operator
+token is `operator[:<X-Agent-Id>]` and sees the whole mesh. `X-Agent-Id` is a label, never a
+credential — an agent cannot rename itself with it, and an operator's label stays self-declared
+(which is why those rows read `operator:qoder`, not `agent:qoder`).
 Agents should also send `X-Agent-Id: <your-id>` so their messages and log rows are attributed.
 Always add `ngrok-skip-browser-warning: true` when traffic crosses ngrok free tier.
 
@@ -296,36 +371,42 @@ Always add `ngrok-skip-browser-warning: true` when traffic crosses ngrok free ti
 | `GET /health` | Liveness + `version` + `features` + `public_url` (no auth) |
 | `GET /llms.txt` | Markdown API guide for agents (no auth) |
 | `GET /api` | JSON manifest: endpoints, socket contract, footguns, auth model (no auth) |
-| `GET /agents` | Connected agents — `{agents:{id:sid}}` (stable shape) plus `count`, `agent_ids`, `detail{id:{sid, connected_at, last_superseded_at, standby_sockets}}`, `standby{id:{sid:since}}` |
+| `GET /agents` | Connected agents — `{agents:{id:sid}}` (stable shape) plus `count`, `agent_ids`, `detail{id:{sid, connected_at, last_seen, last_superseded_at, standby_sockets, inbox_backlog, outstanding_tasks}}`, `standby{id:{sid:since}}` and a `task_ledger{outstanding_by_agent, stranded, dead_letter, ttl_seconds, expiry_note, endpoint}` summary (`stranded` = tasks waiting on an id that no longer has a socket; `expiry_note` = only a row with **no result at all** goes `expired`, an ACK-only row stays outstanding because the hub cannot tell a finished one-result task from a wedged agent) |
 | `GET /agent-id/<id>` | Pre-flight the v1.4 uniqueness rule: `{agent_id, available, taken_by_sid, connected_at, standby_sockets, last_rejection}` — free/never-seen ids return `200 available:true`, malformed ⇒ `400` with the pattern |
-| `POST /agent/<id>/message` | Body `{"text": …}` → routed to agent, returns its **first** reply. Offline ⇒ `404` with start-one hint. `?wait=<0-60>` budget. Caveat: mock_agent auto-ACKs, so `status:"replied"` usually means *received* — poll `GET /result/<msg_id>` or the inbox for the rest |
-| `GET /result/<msg_id>` | Every `result` the hub recorded for one task (last 500 msg_ids, this process only) — `{msg_id, agent, results[], count, status:"first_result"\|"done"\|"answered_via_inbox", answered_via_inbox, updated, note}`. Unknown ⇒ `404` explaining the window |
-| `GET /agent/<id>/inbox` | Unsolicited agent→client messages. **Drains and clears by default** — add `?peek=true` to inspect non-destructively. Returns `drained`, `queue_max`, `agent_online`; entries carry `msg_id` when the sender tagged one |
+| `POST /agent/<id>/message` | Body `{"text": …}` → routed to agent, returns its **first** reply. Offline ⇒ `404` with start-one hint. `?wait=<0-60>` budget (`?wait=0` returns as soon as it is emitted). Every call also answers `task_state` + `result_endpoint` + `expires_at`, because the ledger row is opened at emit time. Caveat: mock_agent auto-ACKs, so `status:"replied"` usually means *received* — poll `GET /result/<msg_id>` or the inbox for the rest |
+| `GET /result/<msg_id>` | The **ledger row** for one task (last 500 msg_ids, this process only) — `{msg_id, agent, from, task, delivered_at, deadline_at, results[], count, state:"delivered"\|"acked"\|"answered"\|"expired", status:"first_result"\|"done"\|"answered_via_inbox", answered_via_inbox, late, hub_issued, seconds_until_expiry, answered_by, updated, note}`. A `404` now means *this hub never issued that msg_id* (or it restarted) — never "nobody answered it"; an unanswered task keeps its row and goes `expired`. Agent credentials read only rows they were tasked with or answered (`403` otherwise) |
+| `GET /tasks/dead-letter` | Triage: every delivered task that produced nothing — `{count, tasks[], newest_last, states, ledger_rows, scoped_to, outstanding_by_agent, expired_total, ttl_seconds, note}`, each row with `reason:"expired"\|"evicted"` + `died`. `?limit=1-200`. An agent credential sees only its own dead rows (`scoped_to` names the filter); the operator token sees the mesh. A growing `outstanding_by_agent` next to a connected agent is the wedged-agent signature |
+| `GET /agent/<id>/inbox` | Unsolicited agent→client messages. **Drains and clears by default** — add `?peek=true` to inspect non-destructively. Returns `drained`, `queue_max`, `agent_online`; entries carry `msg_id` when the sender tagged one. An agent credential may only touch **its own** inbox ⇒ `403` otherwise |
 | `POST /relay` | Body `{"to": "<agent_id>", "text": …}` → hub pushes `peer_msg` to that agent |
-| `POST /file` | `multipart file=@…` or raw body + `X-Filename` (a raw `application/json` body with no `X-Filename` is stored as `body.json`). Optional `X-Target-Agent` pushes a notify; wrong id ⇒ 201 with `target_error`, never silent. Allowed ext: `.json .txt .html .tar.gz .tgz` ≤ 25 MB, ASCII names. 201 returns `sha256`, `delivered`, `duplicate_of` (advisory). **`?dedupe=1`** ⇒ identical bytes already stored returns `200 {status:"existing", file_id:<old>, deduped:true, bytes_stored:false}` instead of a new id |
-| `GET /files` | File metadata table + `count` (persists across restarts via `file_store/index.json`; objects left by pre-v1.1 hubs are auto-adopted from disk at startup) |
-| `GET /file/<file_id>` | Download a stored file |
-| `GET /events/mine` | Structured event rows involving **you** (`X-Agent-Id` required ⇒ `400` without) — `?limit=1-500`, default 100. Agents hold the full-access token but usually not the log secret, so this is their view of the log |
+| `POST /file` | `multipart file=@…` or raw body + `X-Filename` (a raw `application/json` body with no `X-Filename` is stored as `body.json`). Optional `X-Target-Agent` pushes a notify **and** records that agent in `shared_with` — since v1.5 being addressed is what grants it the download. Wrong id ⇒ 201 with `target_error`, never silent. Allowed ext: `.json .txt .html .tar.gz .tgz` ≤ 25 MB, ASCII names. 201 returns `sha256`, `delivered`, `duplicate_of` (advisory). **`?dedupe=1`** ⇒ identical bytes already stored returns `200 {status:"existing", file_id:<old>, deduped:true, bytes_stored:false}` instead of a new id |
+| `GET /files` | File metadata table + `count` (persists across restarts via `file_store/index.json`; objects left by pre-v1.1 hubs are auto-adopted from disk at startup). An agent credential sees only files it uploaded or that named it in `X-Target-Agent`, and the response says so in `scoped_to` |
+| `GET /file/<file_id>` | Download a stored file (as attachment) — `403` for an agent that neither uploaded it nor was addressed by `X-Target-Agent` |
+| `GET /events/mine` | Structured event rows involving **you** — `?limit=1-500`, default 100, plus `caller`. With an agent credential the id comes from the credential, so claiming another agent in `X-Agent-Id` changes nothing; the operator token still needs `X-Agent-Id` (`400` without). Agents hold the full-access token but usually not the log secret, so this is their view of the log |
 | `GET /client.py` | The reference agent client (`mock_agent.py`) as plain Python text — `curl -s $HUB/client.py -H "Authorization: Bearer $T" -o mock_agent.py` |
 | `GET /logs/<LOG_SECRET_TOKEN>` | Auto-refreshing (5 s) + auto-scrolling HTML event log. **Any other token ⇒ 404** |
 | `GET /logs/<LOG_SECRET_TOKEN>/events.json` | Structured event log for agents, `?limit=1-3000` (default 50), newest last |
 
 **Error contract:** every error is JSON `{error, hint, docs:"/llms.txt", api:"/api", …}` with
-the fix spelled out — `400` shape/agent_id (pattern `[A-Za-z0-9_-]{1,40}`), `401` token,
-`404` offline/unknown, `405` wrong verb (valid methods listed), `413` >25 MB, `415` rejected
+the fix spelled out — `400` shape/agent_id (pattern `[A-Za-z0-9_-]{1,40}`), `401` token or
+expired credential, `403` scope violation (`your_agent_id` + `asked_for` say whose credential you
+used and what you reached for, and the attempt is logged as `SCOPE_DENY`), `404` offline/unknown,
+`405` wrong verb (valid methods listed), `413` >25 MB, `415` rejected
 filetype (echoes `name_after_sanitize`), `500` internal (detail only with `HUB_DEBUG=1`).
 Browsers (`Accept: text/html`) keep the HTML onboarding/404 pages.
 
-Socket.IO namespace `/agents`, agent-side events: receives `task`, `peer_msg`,
+Socket.IO namespace `/agents`, agent-side events: receives **`agent_token`** (v1.5 —
+`{agent_id, token, note}`, sent to your socket right after `connect`; use `token` as
+`X-Agent-Token` on HTTP instead of the shared operator token), `task`, `peer_msg`,
 `file_ready`, `superseded` (sent to the old socket when another process registers the same
 `agent_id`) and `reactivated` (sent to that standby when the winner disconnects — its routing
-comes back, no restart needed); sends `result` (replies), `agent_to_client` (optional `msg_id`
-tag ⇒ `GET /result/<msg_id>` reports `answered_via_inbox`), `agent_to_agent`. Exact payloads:
-`GET /api` → `socket`. **`connect` auth is `{"token": …, "agent_id": …}`** and, since v1.4, an
-id that is already live is refused with a reason naming the holder unless you also send
-`"force_takeover": true` (or `?force=1` on the query string). Two-phase replies: the first
-`result` satisfies the HTTP call; **every** result is kept under its `msg_id` for
-`GET /result/<msg_id>`, and untagged late results are queued to the agent's client inbox too.
+comes back with a **fresh credential**, no restart needed); sends `result` (replies),
+`agent_to_client` (optional `msg_id` tag ⇒ `GET /result/<msg_id>` reports `answered_via_inbox`),
+`agent_to_agent`. Exact payloads: `GET /api` → `socket`. **`connect` auth is
+`{"token": …, "agent_id": …}`** and, since v1.4, an id that is already live is refused with a
+reason naming the holder unless you also send `"force_takeover": true` (or `?force=1` on the query
+string). Two-phase replies: the first `result` satisfies the HTTP call; **every** result is kept
+against its `msg_id` in the ledger for `GET /result/<msg_id>`, and untagged late results are queued
+to the agent's client inbox too.
 
 ## mock_agent.py
 
@@ -346,28 +427,40 @@ Everything the agent receives is appended to `state/<agent_id>/inbox.jsonl`
 files are auto-downloaded to `state/<agent_id>/downloads/`. State root = `$HUB_STATE_DIR`
 or `./state` next to the script.
 
+Since v1.5 it also **catches the `agent_token` event and prefers it over the shared token** on
+every HTTP call (`X-Agent-Token`), printing
+`CREDENTIAL issued for 'scout': agent-scoped, sent as X-Agent-Token on HTTP, revoked when this
+socket dies or the id is taken`. Re-minting happens on reconnect and on `reactivated`, so a
+network blip or a take-over never leaves it holding a dead credential, and a hub older than v1.5
+is detected and falls back to the hub token instead of 401-ing in a loop.
+
 One-shot helpers (each prints parsed JSON, or a readable error instead of a traceback):
 `--message <id> --text …` [`--wait <s>`] — send a task and print the reply (reminder: with
-mock_agent that reply is the instant ACK; poll `--inbox <id> --peek` for the real answer) ·
+mock_agent that reply is the instant ACK; poll `--inbox <id> --peek` for the real answer, and
+`GET /result/<msg_id>` for the ledger state) ·
 `--inbox <id> [--peek]` — read/drain the client queue · `--relay-to <id> --text …` ·
 `--upload <path> --to <id>` · `--download <file_id>` · `--agents` · `--check-id <id>` (is that
 name free?) · `--health` · `--docs`. Persistent mode takes `--force-takeover` (env
 `HUB_FORCE_TAKEOVER=1`) to displace a live holder, and if the hub refuses the connect it prints
 who holds the id plus the two ways forward instead of a stack trace.
-One-shot mode labels itself `operator` unless you pass `--agent-id`.
+One-shot mode has no socket, so it authenticates as the **operator** principal and labels itself
+`operator` (or `operator:<your --agent-id>`) unless it is handed a real credential.
 
 ## For AI agents
 
 If you are an LLM agent wired into this hub: start with `GET /llms.txt` (no token needed),
 keep `GET /api` as the machine-readable contract, and read the **Gotchas** section of
 `/llms.txt` before scripting — the inbox is destructive by default, `replied` usually means
-"ACKed, not done", and since v1.4 an `agent_id` that is already connected is *refused* rather
-than silently taken over (`GET /agent-id/<id>` first, or `force_takeover`). You need no local
-checkout: `GET /client.py` (token) returns the reference agent client, and
-`GET /events/mine?limit=50` shows what the hub did with you without the operator's log secret.
-Run `python3 selftest.py --server $HUB --token $AGENT_AUTH_TOKEN` to verify a hub implements
-the v1.4 contract end-to-end (exit 0 = healthy; safe to run against any hub, read-only
-except its own selftest uploads).
+"ACKed, not done", since v1.4 an `agent_id` that is already connected is *refused* rather than
+silently taken over (`GET /agent-id/<id>` first, or `force_takeover`), and since v1.5 your
+identity on HTTP comes from the `agent_token` credential your socket was handed, not from
+`X-Agent-Id`. You need no local checkout: `GET /client.py` (token) returns the reference agent
+client, and `GET /events/mine?limit=50` shows what the hub did with you without the operator's log
+secret. When a task you were given goes quiet, that is now a *stated* fact rather than a missing
+key: `GET /result/<msg_id>` reports `state:"expired"` and `GET /tasks/dead-letter` lists it.
+Run `python3 selftest.py --server $HUB --token $AGENT_AUTH_TOKEN [--agent <live-id>]` to verify a
+hub implements the v1.5 contract end-to-end (exit 0 = healthy; safe to run against any hub,
+read-only except its own selftest uploads).
 
 ## Multi-agent test (verified end-to-end)
 
@@ -386,6 +479,13 @@ Failure paths checked: wrong agent token ⇒ rejected + `AUTH_FAIL`; unauthentic
 API ⇒ `401` with onboarding; killed agent ⇒ `DISCONNECTED` logged and later requests
 return `404` in ~10 ms; bogus log token ⇒ `404`.
 
+The v1.5 paths are covered by their own suites rather than by this role-play: an agent that takes
+a task and goes quiet shows up as `state:"expired"`, a `TASK_EXPIRED` log row and a
+`/tasks/dead-letter` entry (and an answer arriving after that is kept, `late:true`); credentials
+are pushed per socket (`CRED_MINTED`), scope reads (`SCOPE_DENY` on a cross-agent attempt) and die
+with the socket; `python3 selftest.py --server $HUB --token $T --agent <live-id>` checks the whole
+contract (61 checks) against any hub you suspect is behind.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -393,9 +493,16 @@ return `404` in ~10 ms; bogus log token ⇒ `404`.
 | Response is an ngrok HTML warning page | Add `-H "ngrok-skip-browser-warning: true"` |
 | Agent `CONNECT FAILED` | Token mismatch (`AUTH_FAIL` in log) or tunnel down (`/health`) |
 | Agent stopped reaching the hub | Tunnel URL changed on hub restart — re-copy the `ngrok tunnel up:` URL |
+| Agent process alive but printing nothing | It is retrying against a dead URL and the failure lands inside the socket library's own thread. The current `mock_agent.py` says so (`SOCKET DOWN for 10s - … ngrok's dead-URL page; ask for the current URL`); a pre-v1.5 client stays quiet until it gives up at 300 s — re-fetch `GET /client.py` |
 | `404 agent is offline` | Agent process died; hub never hangs on it — restart the agent |
-| No reply, `status: delivered_no_ack` | Agent's socket alive but worker too slow; raise `?wait=` |
-| `status: replied` but work not finished | That was mock_agent's instant ACK. Poll `GET /result/<msg_id>` (every result for that task, `status:"done"` once more than one) or read `GET /agent/<id>/inbox?peek=true` |
+| No reply, `status: delivered_no_ack` | Agent's socket alive but worker too slow; raise `?wait=` — and read `task_state` in the same response: the row exists either way |
+| `status: replied` but work not finished | That was mock_agent's instant ACK. Poll `GET /result/<msg_id>` (`state` goes `delivered` → `acked` → `answered`, `status:"done"` once more than one result) or read `GET /agent/<id>/inbox?peek=true` |
+| `GET /result/<msg_id>` returns `state:"expired"` | The agent took the task and never emitted a `result` within `TASK_TTL_SECONDS`. The task was delivered — look at the agent, not the hub: `/agents` → `detail[id].last_seen` + `outstanding_tasks`, and the row is filed in `GET /tasks/dead-letter` with its `reason`. An answer arriving later still lands, tagged `late:true` |
+| `state:"acked"` forever, never `expired` | Expected: expiry only applies to rows with **no** result, and mock_agent's instant ACK *is* a result. The hub genuinely cannot tell "finished in one message" from "ACKed then wedged", so it does not guess — compare `last_seen` with `outstanding_tasks` in `/agents`, and have the agent emit a second `result` (or an `agent_to_client` tagged with that `msg_id`) to flip the row to `answered` |
+| `404 unknown msg_id` on a task I definitely posted | v1.5 makes that mean *this hub never issued it* — you are talking to a different hub process (the URL rotated on restart; the ledger is in memory) or the row aged past the last 500 tasks. A task this hub emitted keeps its row forever. `GET /tasks/dead-letter` lists the abandoned ones |
+| `403 this credential is 'scout', it may not read …` | Correct behavior, not a bug: an agent credential only covers its own `agent_id` (v1.5). Connect as that agent to get its credential, or use the operator `AGENT_AUTH_TOKEN` for cross-agent reads |
+| An agent's HTTP calls suddenly `401` | Its credential expired with the socket — disconnect, take-over, or hub restart. `mock_agent.py` re-mints automatically; a hand-rolled client must re-read the `agent_token` event after reconnecting. Pin `HUB_CRED_SECRET` if you want credentials to survive a restart |
+| `HUB_OPERATOR_HTTP=0` and every call `401`s | That flag makes the master token socket-only on purpose — no HTTP caller may be anonymous, so send an agent credential (or start without the flag) |
 | 401 came back as JSON, not the guide page | v1.1 behavior — the JSON carries `hint` + `example`; HTML needs `Accept: text/html` |
 | Upload mysteriously stored as `body.json` | A raw `application/json` body without `X-Filename` is auto-named; send `-F file=@name.json` when the name matters |
 | Two agents fight over one id | Refused since v1.4: the second socket never connects (see next row). Give each process its own `agent_id` — suffix the pid, `scout-2`, or a role name. On a pre-v1.4 hub the newest socket won routing by design; the loser got `superseded`, stayed listed under `/agents` `standby`, and received `reactivated` if the winner died (v1.3) |
