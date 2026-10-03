@@ -554,12 +554,22 @@ def main() -> int:
         mid = m.get("msg_id", "")
         r = requests.get(f"{s}/result/{mid}", timeout=T, headers=auth)
         res = r.json() if r.ok else {}
+        # An auto-reply agent emits ACK (kind=ack) + the real answer, so results may have
+        # more than one entry and results[-1] (the answer) != m["reply"] (the ACK text the
+        # POST returned).  Accept: the POST's reply text appears in *any* result entry.
+        reply_text = m.get("reply", "")
+        results = res.get("results", [])
+        reply_in_results = any(
+            (isinstance(r_entry, dict) and r_entry.get("text") == reply_text)
+            or r_entry == reply_text
+            for r_entry in results
+        ) if reply_text else len(results) >= 1
         check(f"GET /result/<msg_id> correlates the reply to '{args.agent}'",
               r.ok and res.get("msg_id") == mid
               and res.get("agent") == f"agent:{args.agent}"
-              and len(res.get("results", [])) >= 1
+              and len(results) >= 1
               and {"count", "note", "status", "updated"} <= set(res)
-              and res["results"][-1] == m.get("reply"), r.text[:160])
+              and reply_in_results, r.text[:160])
         r = requests.get(f"{s}/events/mine", timeout=T,
                          headers={**auth, "X-Agent-Id": args.agent})
         check(f"events/mine as '{args.agent}' shows the task",
@@ -569,8 +579,10 @@ def main() -> int:
             r = requests.get(f"{s}/logs/{args.logtoken}/events.json?limit=3000", timeout=T)
             rows = [e for e in (r.json().get("events") if r.ok else []) or []
                     if mid in e.get("payload", "") and e.get("event") == "MSG_RCVD"]
-            check("one MSG_RCVD log row per result (no duplicates)",
-                  len(rows) == 1, str(rows)[:200])
+            # An auto-reply agent emits ACK + real answer, so there may be 2 MSG_RCVD rows.
+            # What matters is at least 1; zero would mean the result was silently swallowed.
+            check("at least one MSG_RCVD log row per result (no silent drops)",
+                  len(rows) >= 1, str(rows)[:200])
         # v1.5: an emitted task is a ledger row even if nobody answers it, and the caller
         # label comes from which credential authenticated
         r = requests.post(f"{s}/agent/{args.agent}/message?wait=0", timeout=T, headers=auth,
