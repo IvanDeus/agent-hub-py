@@ -44,13 +44,15 @@ serves on `localhost` only.
   / `?force=1` (the v1.3 standby chain still applies).
 - **ngrok free tier** — every client should send `ngrok-skip-browser-warning: true`
   or ngrok returns its interstitial HTML page instead of your API response.
-- **Operator log viewer** — append-only `logs.html` with a 5 s auto-refreshing
-  dark/light page at `/logs/<LOG_SECRET_TOKEN>` (404 for any wrong token), colored
+- **Operator log viewer** — append-only `logs.html` with a 5 s auto-refreshing,
+  auto-scrolling dark/light page at `/logs/<LOG_SECRET_TOKEN>` (404 for any wrong
+  token), colored
   badges: `CONNECTED` `DISCONNECTED` `MSG_SENT` `MSG_RCVD` `AUTH_FAIL` `ID_REJECTED`
   `FILE_SENT` `FILE_RCVD` `MSG_FAIL`. Agents get their own slice without the log secret
   via `GET /events/mine`; `?peek=true` makes inbox reads non-destructive; `?dedupe=1`
   makes re-uploading identical bytes a no-op; a stolen `agent_id` now sends the loser a
-  `superseded` event instead of stealing traffic in silence.
+  `superseded` event instead of stealing traffic in silence. Startup prints the page as a
+  clickable URL (`Logs are: …`), loopback first and the ngrok edge right after it comes up.
 
 ## Changelog
 
@@ -114,7 +116,7 @@ no monkey-patching needed). The `ngrok` package is optional: if it is missing, o
 | `LOG_SECRET_TOKEN` | Secret URL segment for the live log page `/logs/<token>` | required, 4–64 URL-safe chars |
 | `NGROK_AUTHTOKEN` | The hub opens its own ngrok tunnel with it (via `import ngrok`) | optional — unset ⇒ warns, localhost only |
 | `HUB_PORT` | Hub listen port | default `5000` |
-| `HUB_BIND` | Hub listen interface | default `0.0.0.0` — use `127.0.0.1` for isolated tests |
+| `HUB_BIND` | Hub listen interface | default `127.0.0.1` — the hub is local-only; publish it behind nginx (see below) or ngrok |
 | `ACK_TIMEOUT` | Seconds the hub waits for an agent reply | default `10` |
 | `NGROK_DOMAIN` | Reserved ngrok domain passed to `ngrok.forward()` — the public URL survives restarts | optional — needs a domain claimed in the ngrok dashboard |
 | `HUB_FILE_STORE` / `HUB_LOG_FILE` | Relocate `file_store/` / `logs.html` (test isolation) | optional — default next to `app.py` |
@@ -131,7 +133,13 @@ export LOG_SECRET_TOKEN='changeme-secretlogpath'
 export NGROK_AUTHTOKEN='<your-ngrok-authtoken>'
 python3 app.py
 ```
-the hub prints "ngrok tunnel up: <url>"
+the hub prints a clickable log-page URL, then "ngrok tunnel up: <url>"
+```
+[agent-hub] Logs are: http://localhost:5000/logs/changeme-secretlogpath
+[agent-hub] ngrok tunnel up: https://<your-id>.ngrok-free.app
+[agent-hub] Logs are (public): https://<your-id>.ngrok-free.app/logs/changeme-secretlogpath
+```
+Use that URL for everything below:
 ```
 HUB=https://<your-id>.ngrok-free.app        
 ```
@@ -149,7 +157,8 @@ curl -s -X POST $HUB/agent/scout/message \
 ```
 
 Without `NGROK_AUTHTOKEN` everything below step 1 runs the same way against
-`HUB=http://localhost:5000` — only the public URL is missing.
+`HUB=http://localhost:5000` — only the public URL is missing. The hub binds
+`127.0.0.1` by default and prints an nginx recipe for publishing it (see next section).
 
 Open `$HUB/` in a browser any time for the full onboarding reference. If **you are the
 agent**, fetch the canonical guide instead — it is plain markdown and needs no token:
@@ -158,6 +167,43 @@ agent**, fetch the canonical guide instead — it is plain markdown and needs no
 curl -s $HUB/llms.txt                          # API guide for LLM agents
 curl -s $HUB/api | python3 -m json.tool        # machine manifest (endpoints + socket contract)
 ```
+
+## Publishing without ngrok (local nginx)
+
+The hub is a plain HTTP server on `127.0.0.1:5000`, so a local nginx reverse proxy is the
+other way to make it reachable — your own domain, your own certificate, no URL that changes
+on every restart. Terminate TLS in nginx, keep gzip on for the JSON/file payloads, and pass
+both `X-Forwarded-For` and the WebSocket upgrade headers, otherwise every agent shows up as
+`127.0.0.1` in the access log and the `/agents` namespace silently drops to long polling:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name hub.example.com;
+    ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;
+
+    gzip on; gzip_min_length 1024;
+    gzip_types application/json text/plain text/css;
+    client_max_body_size 25m;              # matches MAX_UPLOAD in app.py
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;   # the hub reads this for redirects
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        "upgrade";
+        proxy_read_timeout 3600s; proxy_send_timeout 3600s;   # sockets must not idle out
+    }
+}
+```
+
+Then point agents and clients at `https://hub.example.com`. `pip install simple-websocket`
+on the hub host is what lets Flask-SocketIO actually answer the `Upgrade` request; without
+it the console warns "WebSocket transport not available" and clients fall back to polling.
 
 ## Running an agent client through the tunnel
 
@@ -168,6 +214,7 @@ the tunnel is up the hub prints a ready-to-paste command for exactly that:
 ```
 [agent-hub] ngrok tunnel up: https://<your-id>.ngrok-free.app
 [agent-hub]   agents:  python3 mock_agent.py --server https://<your-id>.ngrok-free.app --agent-id <id> --token "$AGENT_AUTH_TOKEN"
+[agent-hub] Logs are (public): https://<your-id>.ngrok-free.app/logs/$LOG_SECRET_TOKEN
 ```
 
 Copy the URL and run it on the agent machine:
@@ -260,7 +307,7 @@ Always add `ngrok-skip-browser-warning: true` when traffic crosses ngrok free ti
 | `GET /file/<file_id>` | Download a stored file |
 | `GET /events/mine` | Structured event rows involving **you** (`X-Agent-Id` required ⇒ `400` without) — `?limit=1-500`, default 100. Agents hold the full-access token but usually not the log secret, so this is their view of the log |
 | `GET /client.py` | The reference agent client (`mock_agent.py`) as plain Python text — `curl -s $HUB/client.py -H "Authorization: Bearer $T" -o mock_agent.py` |
-| `GET /logs/<LOG_SECRET_TOKEN>` | Auto-refreshing HTML event log. **Any other token ⇒ 404** |
+| `GET /logs/<LOG_SECRET_TOKEN>` | Auto-refreshing (5 s) + auto-scrolling HTML event log. **Any other token ⇒ 404** |
 | `GET /logs/<LOG_SECRET_TOKEN>/events.json` | Structured event log for agents, `?limit=1-3000` (default 50), newest last |
 
 **Error contract:** every error is JSON `{error, hint, docs:"/llms.txt", api:"/api", …}` with

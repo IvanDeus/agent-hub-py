@@ -25,6 +25,7 @@ from pathlib import Path
 from flask import Flask, Response, abort, jsonify, request, send_file
 from flask_socketio import ConnectionRefusedError, SocketIO
 from werkzeug.exceptions import HTTPException
+from werkzeug.serving import BaseWSGIServer
 from werkzeug.utils import secure_filename
 
 # ----------------------------------------------------------------- config
@@ -40,7 +41,7 @@ FAVICON_ROUTE = "/favicon.ico"
 AGENT_TOKEN = os.environ.get("AGENT_AUTH_TOKEN", "")     # sole hub token (6-50 chars)
 LOG_SECRET = os.environ.get("LOG_SECRET_TOKEN", "")      # secret path segment for /logs/<token>
 HUB_PORT = int(os.environ.get("HUB_PORT", "5000"))
-HUB_BIND = os.environ.get("HUB_BIND", "0.0.0.0")
+HUB_BIND = os.environ.get("HUB_BIND", "127.0.0.1")  # local only; publish behind nginx or ngrok
 ACK_TIMEOUT = float(os.environ.get("ACK_TIMEOUT", "10"))
 NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")  # optional: public tunnel, else localhost only
 NGROK_DOMAIN = os.environ.get("NGROK_DOMAIN", "")        # optional: reserved ngrok domain (stable URL)
@@ -113,6 +114,21 @@ header .sub{color:var(--muted);font-size:12px}
 """
 
 
+LOG_JS = """
+(function(){
+  var K='hub-log-gap', el=document.documentElement;
+  function bottom(){return Math.max(0,el.scrollHeight-window.innerHeight)}
+  function gap(){
+    try{var g=parseFloat(sessionStorage.getItem(K));return isFinite(g)&&g>0?g:0}catch(e){return 0}
+  }
+  window.scrollTo(0,Math.max(0,bottom()-gap()));
+  window.addEventListener('pagehide',function(){
+    try{sessionStorage.setItem(K,String(Math.max(0,bottom()-window.scrollY)))}catch(e){}
+  });
+})();
+"""
+
+
 def _render_log() -> str:
     rows = "".join(LOG_ROWS)
     return ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
@@ -121,9 +137,10 @@ def _render_log() -> str:
             f"<link rel='icon' href='{FAVICON_ROUTE}'>"
             f"<style>{LOG_CSS}</style></head><body>"
             "<header><h1>Agent Hub - Event Log</h1>"
-            "<span class='sub'>auto-refresh 5s &middot; append-only &middot; "
+            "<span class='sub'>auto-refresh 5s &middot; auto-scroll &middot; append-only &middot; "
             f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</span></header>"
-            f"<div id='log'>{rows}</div></body></html>")
+            f"<div id='log'>{rows}</div>"
+            f"<script>{LOG_JS}</script></body></html>")
 
 
 def log_event(event: str, agent_id: str, direction: str, payload: str = "") -> None:
@@ -303,7 +320,7 @@ API_ENDPOINTS = [
     {"method": "GET", "path": "/client.py", "auth": "token",
      "summary": "The reference agent client (mock_agent.py) as plain Python text - read it, save it, run it.",
      "example": "curl -s $HUB/client.py -H \"Authorization: Bearer $T\" -H \"ngrok-skip-browser-warning: true\" -o mock_agent.py"},
-    {"method": "GET", "path": "/logs/{LOG_SECRET_TOKEN}", "auth": "secret path", "summary": "Auto-refreshing HTML event log. Any other token => 404."},
+    {"method": "GET", "path": "/logs/{LOG_SECRET_TOKEN}", "auth": "secret path", "summary": "Auto-refreshing (5s) + auto-scrolling HTML event log. Any other token => 404."},
     {"method": "GET", "path": "/logs/{LOG_SECRET_TOKEN}/events.json", "auth": "secret path",
      "summary": "Structured event log for agents.", "query": {"limit": "1-3000, default 50"}},
     {"method": "GET", "path": "/favicon.ico", "auth": "none", "summary": "Hub icon."},
@@ -528,7 +545,8 @@ def _build_llms_md() -> str:
         "## Hub env vars",
         "",
         "`AGENT_AUTH_TOKEN` (req) &middot; `LOG_SECRET_TOKEN` (req) &middot; `HUB_PORT` (5000) &middot;"
-        " `HUB_BIND` (0.0.0.0) &middot; `ACK_TIMEOUT` (10s) &middot; `NGROK_AUTHTOKEN` (optional"
+        " `HUB_BIND` (127.0.0.1 - the hub is local by default, publish it behind nginx or ngrok)"
+        " &middot; `ACK_TIMEOUT` (10s) &middot; `NGROK_AUTHTOKEN` (optional"
         " public tunnel) &middot; `NGROK_DOMAIN` (pin reserved domain so URL survives restarts) &middot;"
         " `HUB_FILE_STORE` / `HUB_LOG_FILE` (relocate state for tests) &middot; `HUB_DEBUG=1`."
         " mock_agent honors `HUB_STATE_DIR`.",
@@ -1202,6 +1220,40 @@ def _warn_localhost(reason: str) -> None:
     msg = f"{reason} - no tunnel, serving localhost only on http://localhost:{HUB_PORT}"
     print(f"[agent-hub] WARN: {msg}")
     log_event("SERVER", "-", "Server -> Server", msg)
+    if HUB_BIND not in ("127.0.0.1", "localhost", "::1"):
+        print(f"[agent-hub]   HUB_BIND={HUB_BIND} exposes the development server directly: "
+              f"run with HUB_BIND=127.0.0.1 and publish through nginx instead")
+    for line in (
+        "to publish without ngrok, terminate TLS in local nginx and reverse-proxy this port;",
+        "pass X-Forwarded-For and the Upgrade/Connection headers so agents reach the hub",
+        "over WebSocket from their real IP rather than from 127.0.0.1:",
+        "  server {",
+        "    listen 443 ssl http2;",
+        "    server_name hub.example.com;",
+        "    ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;",
+        "    ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;",
+        "    gzip on; gzip_min_length 1024;",
+        "    gzip_types application/json text/plain text/css;",
+        f"    client_max_body_size {MAX_UPLOAD // (1024 * 1024)}m;",
+        "    location / {",
+        f"      proxy_pass http://127.0.0.1:{HUB_PORT};",
+        "      proxy_http_version 1.1;",
+        "      proxy_set_header Host              $host;",
+        "      proxy_set_header X-Real-IP         $remote_addr;",
+        "      proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;",
+        "      proxy_set_header X-Forwarded-Proto $scheme;",
+        "      proxy_set_header Upgrade           $http_upgrade;",
+        '      proxy_set_header Connection        "upgrade";',
+        "      proxy_read_timeout 3600s; proxy_send_timeout 3600s;",
+        "    }",
+        "  }",
+    ):
+        print(f"[agent-hub]   {line}")
+    try:
+        import simple_websocket  # noqa: F401  - the engine that answers the Upgrade above
+    except ImportError:
+        print("[agent-hub]   NOTE: simple-websocket is not installed (pip install simple-websocket),"
+              " so agents fall back to long polling")
 
 
 def open_tunnel() -> None:
@@ -1232,7 +1284,23 @@ def open_tunnel() -> None:
     print(f"[agent-hub] ngrok tunnel up: {url}")
     print(f"[agent-hub]   agents:  python3 mock_agent.py --server {url} --agent-id <id> --token \"$AGENT_AUTH_TOKEN\"")
     print(f"[agent-hub]   clients: send header  ngrok-skip-browser-warning: true  on every request")
+    print(f"[agent-hub] Logs are (public): {url}/logs/{LOG_SECRET}", flush=True)
     log_event("SERVER", "-", "Server -> ngrok edge", f"public {url} -> :{HUB_PORT}")
+
+
+# ----------------------------------------------------------------- startup banner
+def announce_log_urls() -> None:
+    """Print the log page as a clickable URL straight after werkzeug's own
+    'Running on ...' lines, so the operator never retypes the secret. The ngrok edge
+    adds its public URL from open_tunnel(), which usually comes up a second later."""
+    banner = BaseWSGIServer.log_startup
+
+    def log_startup(server):
+        banner(server)
+        print(f"[agent-hub] Logs are: http://localhost:{HUB_PORT}/logs/{LOG_SECRET}",
+              flush=True)
+
+    BaseWSGIServer.log_startup = log_startup
 
 
 # ----------------------------------------------------------------- main
@@ -1242,7 +1310,7 @@ if __name__ == "__main__":
     log_event("SERVER", "-", "Server -> Server",
               f"hub v{HUB_VERSION} started on {HUB_BIND}:{HUB_PORT} (threading mode)")
     print(f"[agent-hub] v{HUB_VERSION} listening on {HUB_BIND}:{HUB_PORT} | agents socket ns={NS} | "
-          f"hub token len={len(AGENT_TOKEN)} | "
-          f"log page = /logs/{LOG_SECRET[:3]}*** | docs = /llms.txt")
+          f"hub token len={len(AGENT_TOKEN)} | docs = /llms.txt")
+    announce_log_urls()
     threading.Thread(target=open_tunnel, daemon=True).start()
     socketio.run(app, host=HUB_BIND, port=HUB_PORT, debug=False, allow_unsafe_werkzeug=True)
