@@ -6,15 +6,20 @@ are supersets, never exact equality, so future additive fields pass.
 
     python3 selftest.py --server https://<hub> --token "$AGENT_AUTH_TOKEN" [--logtoken <LOG_SECRET_TOKEN>] [--agent <connected_id>]
 
-Exit 0 = all checks passed, 1 = at least one failure."""
+Exit 0 = all checks passed, 1 = at least one failure. A --server that isn't reachable or
+isn't a hub stops the run at once with a diagnosis instead of ~100 FAIL lines and a
+traceback; set SELFTEST_DEBUG=1 to see that traceback anyway."""
 
 import argparse
 import hashlib
 import json
+import os
+import re
 import secrets
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 
 import requests
 
@@ -29,10 +34,67 @@ PASS = []
 FAIL = []
 
 
+def one_line(x: object, limit: int = 160) -> str:
+    """Collapse whitespace and clip: a detail printed after `<-` must stay on one line."""
+    flat = " ".join(str(x).split())
+    return flat if len(flat) <= limit else flat[:limit].rstrip() + " ..."
+
+
+def port_hint(base: str) -> str:
+    """The likeliest fix when something owns :80 but isn't a hub: HUB_PORT is 5000."""
+    netloc = urlparse(base).netloc.split("@")[-1]
+    if ":" in netloc or netloc not in ("localhost", "127.0.0.1", "0.0.0.0"):
+        return ""
+    return (f"a hub on this machine listens on HUB_PORT, 5000 by default - try "
+            f"--server http://{netloc}:5000")
+
+
+def jval(r: requests.Response) -> dict:
+    """JSON body as a dict, {} if it isn't JSON -- a hub answering HTML fails its check
+    instead of raising JSONDecodeError partway through the run."""
+    try:
+        body = r.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def neterr(exc: BaseException, url: str) -> str:
+    """One human line for a requests failure; the raw exception is nested urllib3 reprs."""
+    txt = one_line(exc, 400)
+    for key, say in (
+            ("Connection refused", f"nothing is listening at {url}"),
+            ("Name or service not known", f"cannot resolve the host in {url}"),
+            ("Read timed out", f"{url} took the connection but never answered"),
+            ("timed out", f"{url} did not answer in time"),
+            ("No scheme supplied", f"{url} has no http:// or https:// scheme"),
+            ("No connection adapters", f"{url} has no http:// or https:// scheme"),
+            ("Max retries exceeded", f"{url} refused the request")):
+        if key in txt:
+            return say
+    return f"{type(exc).__name__} talking to {url}: {one_line(txt, 140)}"
+
+
+def redact(secret: str) -> str:
+    return f"{secret[:3]}*** ({len(secret)} chars)" if secret else "(empty)"
+
+
+def bail(title: str, *lines: str) -> int:
+    """Stop the run with a diagnosis on stderr and the exit code a failure uses."""
+    notes = list(lines)
+    while notes and not notes[-1]:
+        notes.pop()
+    print(f"\nERROR  {title}", file=sys.stderr)
+    for ln in notes:
+        print(f"       {ln}" if ln else "", file=sys.stderr)
+    return 1
+
+
 def check(name: str, cond: bool, detail: str = "") -> None:
     (PASS if cond else FAIL).append(name)
     mark = "PASS" if cond else "FAIL"
-    print(f"{mark:4}  {name}" + (f"  <- {detail}" if not cond and detail else ""))
+    note = one_line(detail)
+    print(f"{mark:4}  {name}" + (f"  <- {note}" if not cond and note else ""))
 
 
 def main() -> int:
@@ -53,13 +115,65 @@ def main() -> int:
             "ngrok-skip-browser-warning": "true", "Accept": "application/json"}
     T = args.timeout
 
+    # ---- pre-flight: /health is the hub's own unauthenticated handshake. Without this gate a
+    #      wrong --server (typo, dead port, nginx site root) cascades through every check.
+    url = f"{s}/health"
+    local_hint = port_hint(s)
+    fix = ([local_hint] if local_hint else
+           ["--server is the hub's base URL: no path, no trailing slash, e.g.",
+            "    --server http://127.0.0.1:5000        a hub on this machine",
+            "    --server https://<id>.ngrok-free.app  a tunnel to it"])
+    try:
+        probe = requests.get(url, timeout=T,
+                             headers={"ngrok-skip-browser-warning": "true",
+                                      "Accept": "application/json"})
+    except requests.RequestException as e:
+        return bail(f"cannot reach {url}", neterr(e, url), "",
+                    "Start a hub: AGENT_AUTH_TOKEN=<6-50 chars> LOG_SECRET_TOKEN=<secret> "
+                    "python3 app.py", *fix)
+
+    body, ctype = jval(probe), probe.headers.get("content-type", "")
+    if probe.status_code in (401, 403):
+        return bail(f"{url} answered {probe.status_code}, but a hub never asks for a "
+                    "token on /health",
+                    f"{ctype or 'no content-type'}: {one_line(probe.text, 140)}",
+                    "", "A proxy in front of this URL is enforcing auth, or it is another "
+                    "service. Point --server at the hub itself.", *fix)
+    if not probe.ok or "json" not in ctype or not body:
+        says = " - ".join(one_line(x, 90) for x in (body.get("error"), body.get("hint")) if x)
+        prefix = urlparse(s).path.strip("/")
+        return bail(f"{s} is not an Agent Hub",
+                    f"GET /health -> {probe.status_code} {ctype or 'no content-type'}"
+                    + (f" from {probe.headers['server']}" if probe.headers.get("server") else ""),
+                    (f"it says: {says}" if says
+                     else f"body: {one_line(probe.text, 140) or '(empty)'}"),
+                    "",
+                    "Expected 200 application/json carrying status / agents_connected / features.",
+                    (f"Your --server carries a path (/{prefix}); /health lives at the hub's own "
+                     "root - drop it unless nginx mounts the hub under that prefix."
+                     if prefix else
+                     "Whatever answers here is not the hub: behind nginx that is usually the "
+                     "site root, not the location proxying to it."),
+                    *([local_hint] if prefix else fix))
+    if not {"status", "agents_connected", "features"} <= set(body):
+        return bail(f"{s} answers /health with JSON but is not an Agent Hub",
+                    f"keys present: {sorted(body)[:8]}",
+                    "", "A different service on that port: expected at least status, "
+                    "agents_connected and features.", *fix)
+
+    r = requests.get(f"{s}/agents", timeout=T, headers=auth)
+    if r.status_code == 401:
+        print(f"WARN   --token {redact(args.token)} was refused by GET /agents "
+              f"({one_line(jval(r).get('error') or r.text, 90)}) - every authenticated "
+              "check below will fail")
+
     # ---- discovery, unauthenticated
     r = requests.get(f"{s}/health", timeout=T)
     check("health 200 + core keys",
           r.ok and {"status", "agents_connected", "version", "features",
-                    "uptime_seconds", "docs", "api"} <= set(r.json()), r.text[:120])
+                    "uptime_seconds", "docs", "api"} <= set(jval(r)), r.text[:120])
     if r.ok:
-        h = r.json()
+        h = jval(r)
         check("health features advertise the full v1.4 contract",
               set(REQUIRED_FEATURES) <= set(h.get("features", [])),
               str(h.get("features")))
@@ -67,7 +181,7 @@ def main() -> int:
               {"status", "agents_connected", "uptime"} <= set(h))
 
     r = requests.get(f"{s}/api", timeout=T)
-    manifest = r.json() if r.ok and "json" in r.headers.get("content-type", "") else {}
+    manifest = jval(r) if r.ok and "json" in r.headers.get("content-type", "") else {}
     check("api manifest 200 + sections",
           r.ok and {"version", "base_url", "endpoints", "socket",
                     "footguns", "features", "auth"} <= set(manifest), r.text[:120])
@@ -89,7 +203,7 @@ def main() -> int:
     # ---- auth negotiation
     r = requests.get(f"{s}/agents", timeout=T)  # no token
     ok_json = (r.status_code == 401 and "json" in r.headers.get("content-type", "")
-               and {"error", "hint", "docs", "api", "example"} <= set(r.json()))
+               and {"error", "hint", "docs", "api", "example"} <= set(jval(r)))
     check("401 tokenless = JSON with hint", ok_json, f"{r.status_code} {r.text[:80]}")
     r = requests.get(f"{s}/agents", timeout=T, headers={"Accept": "text/html"})
     check("401 browser = HTML onboarding",
@@ -97,8 +211,8 @@ def main() -> int:
     r = requests.get(f"{s}/agents", timeout=T, headers=auth)
     check("agents 200 + legacy + new keys",
           r.ok and {"agents", "count", "agent_ids", "detail", "standby", "standby_note"}
-          <= set(r.json()), str(list(r.json())))
-    ag = r.json() if r.ok else {}
+          <= set(jval(r)), str(list(jval(r))))
+    ag = jval(r) if r.ok else {}
     check("agents detail carries standby accounting",
           all({"sid", "connected_at", "last_superseded_at", "standby_sockets"} <= set(d)
               for d in ag.get("detail", {}).values()), str(ag.get("detail"))[:140])
@@ -110,19 +224,19 @@ def main() -> int:
           f"{r.status_code}")
     r = requests.post(f"{s}/agent/bad%20id/message", timeout=T, headers=auth, json={"text": "x"})
     check("bad agent_id = 400 + pattern",
-          r.status_code == 400 and "pattern" in r.json(), r.text[:80])
+          r.status_code == 400 and "pattern" in jval(r), r.text[:80])
     r = requests.post(f"{s}/agent/nobody-9x/message", timeout=T, headers=auth, json={"text": "x"})
     check("offline agent = 404 + start-one hint",
-          r.status_code == 404 and "mock_agent.py" in r.json().get("hint", ""), r.text[:80])
+          r.status_code == 404 and "mock_agent.py" in jval(r).get("hint", ""), r.text[:80])
     r = requests.post(f"{s}/relay", timeout=T, headers=auth, json={"to": "bad id"})
-    check("relay bad body = 400", r.status_code == 400 and "error" in r.json())
+    check("relay bad body = 400", r.status_code == 400 and "error" in jval(r))
 
     # ---- file store
     payload = json.dumps({"selftest": secrets.token_hex(4)}).encode()
     sha = hashlib.sha256(payload).hexdigest()
     name = "selftest.json"
     r = requests.post(f"{s}/file", timeout=T, headers=auth, files={"file": (name, payload)})
-    up = r.json() if r.ok else {}
+    up = jval(r) if r.ok else {}
     check("upload multipart 201 + sha256",
           r.status_code == 201 and {"status", "file_id", "name", "size", "sha256",
                                     "delivered", "download_url"} <= set(up)
@@ -131,24 +245,24 @@ def main() -> int:
 
     r = requests.post(f"{s}/file", timeout=T, headers=auth, files={"file": (name, payload)})
     check("same bytes = duplicate_of advisory",
-          r.status_code == 201 and r.json().get("duplicate_of") == fid, r.text[:120])
+          r.status_code == 201 and jval(r).get("duplicate_of") == fid, r.text[:120])
 
     r = requests.post(f"{s}/file", timeout=T,
                       headers={**auth, "Content-Type": "application/json"},
                       data=payload)
     check("raw JSON body auto-names body.json",
-          r.status_code == 201 and r.json().get("name") == "body.json", r.text[:120])
+          r.status_code == 201 and jval(r).get("name") == "body.json", r.text[:120])
 
     r = requests.post(f"{s}/file", timeout=T, headers=auth,
                       files={"file": ("\u5831\u544a.json", payload)})
-    bad = r.json() if r.status_code == 415 else {}
+    bad = jval(r) if r.status_code == 415 else {}
     check("non-ASCII name = 415 echo sanitized name",
           r.status_code == 415 and "name_after_sanitize" in bad, r.text[:120])
 
     r = requests.post(f"{s}/file", timeout=T,
                       headers={**auth, "X-Target-Agent": "nosuch-9x"},
                       files={"file": (name, payload)})
-    tgt = r.json() if r.ok else {}
+    tgt = jval(r) if r.ok else {}
     check("bad X-Target-Agent = 201 + target_error",
           r.status_code == 201 and tgt.get("delivered") is False and "target_error" in tgt,
           r.text[:120])
@@ -157,9 +271,9 @@ def main() -> int:
     check("download bytes match sha", r.ok and hashlib.sha256(r.content).hexdigest() == sha)
     r = requests.get(f"{s}/file/deadbeef00000000", timeout=T, headers=auth)
     check("unknown file_id = 404 + hint",
-          r.status_code == 404 and "hint" in r.json(), r.text[:80])
+          r.status_code == 404 and "hint" in jval(r), r.text[:80])
     r = requests.get(f"{s}/files", timeout=T, headers=auth)
-    fl = r.json() if r.ok else {}
+    fl = jval(r) if r.ok else {}
     check("files list: count + created_iso",
           r.ok and {"files", "count"} <= set(fl)
           and "created_iso" in fl.get("files", {}).get(fid, {}), r.text[:120])
@@ -167,7 +281,7 @@ def main() -> int:
     # ---- v1.5.2: DELETE /file/<id> exists, is scoped, and actually reclaims
     r = requests.delete(f"{s}/file/deadbeef00000000", timeout=T, headers=auth)
     check("DELETE unknown file_id = 404 + hint",
-          r.status_code == 404 and "hint" in r.json(), r.text[:100])
+          r.status_code == 404 and "hint" in jval(r), r.text[:100])
     r = requests.delete(f"{s}/file/deadbeef00000000", timeout=T,
                         headers={"Accept": "application/json",
                                  "ngrok-skip-browser-warning": "true"})
@@ -175,20 +289,20 @@ def main() -> int:
     throw = json.dumps({"throwaway": secrets.token_hex(4)}).encode()
     r = requests.post(f"{s}/file", timeout=T, headers=auth,
                       files={"file": ("del-me.json", throw)})
-    fid2 = r.json().get("file_id", "") if r.status_code == 201 else ""
+    fid2 = jval(r).get("file_id", "") if r.status_code == 201 else ""
     r = requests.delete(f"{s}/file/{fid2}", timeout=T, headers=auth)
     check("operator DELETE of own upload = 200 deleted + freed_bytes",
-          bool(fid2) and r.status_code == 200 and r.json().get("status") == "deleted"
-          and r.json().get("freed_bytes") == len(throw), r.text[:140])
+          bool(fid2) and r.status_code == 200 and jval(r).get("status") == "deleted"
+          and jval(r).get("freed_bytes") == len(throw), r.text[:140])
     r = requests.get(f"{s}/file/{fid2}", timeout=T, headers=auth)
     check("deleted file_id 404s on download", r.status_code == 404, f"{r.status_code}")
     r = requests.get(f"{s}/files", timeout=T, headers=auth)
-    check("deleted id gone from GET /files", bool(fid2)
-          and fid2 not in r.json().get("files", {}))
+    check("deleted id gone from GET /files", bool(fid2) and r.ok
+          and fid2 not in jval(r).get("files", {}))
 
     # ---- v1.7: retention / housekeeping (GET /retention, POST /retention/sweep)
     r = requests.get(f"{s}/retention", timeout=T, headers=auth)
-    rep = r.json() if r.status_code == 200 else {}
+    rep = jval(r) if r.status_code == 200 else {}
     check("GET /retention = 200 dry-run report",
           r.status_code == 200 and rep.get("dry_run") is True
           and "removed" in rep and "retention_days" in rep, r.text[:150])
@@ -201,38 +315,38 @@ def main() -> int:
           and "sweep_every_seconds" in (rep.get("config") or {}), str(rep.get("config")))
     r = requests.get(f"{s}/retention", timeout=T)
     check("tokenless GET /retention = 401 JSON", r.status_code == 401
-          and "hint" in r.json(), f"{r.status_code}")
+          and "hint" in jval(r), f"{r.status_code}")
     r = requests.get(f"{s}/health", timeout=T)
-    h = r.json()
+    h = jval(r)
     check("health advertises retention_sweep + its schedule",
           "retention_sweep" in h.get("features", []) and "retention" in h, str(h.get("retention")))
-    before = set(requests.get(f"{s}/files", timeout=T, headers=auth).json().get("files", {}))
+    before = set(jval(requests.get(f"{s}/files", timeout=T, headers=auth)).get("files", {}))
     r = requests.post(f"{s}/retention/sweep?dry=1", timeout=T, headers=auth)
-    after = set(requests.get(f"{s}/files", timeout=T, headers=auth).json().get("files", {}))
+    after = set(jval(requests.get(f"{s}/files", timeout=T, headers=auth)).get("files", {}))
     check("POST /retention/sweep?dry=1 = 200 and deletes nothing",
           r.status_code == 200 and before == after, f"{r.status_code}")
     r = requests.delete(f"{s}/file/{fid}", timeout=T, headers=auth)
     check("operator DELETE of a fresh upload still works after the sweep code landed",
           r.status_code == 200 and fid not in
-          requests.get(f"{s}/files", timeout=T, headers=auth).json().get("files", {}),
+          jval(requests.get(f"{s}/files", timeout=T, headers=auth)).get("files", {}),
           f"{r.status_code}")
 
     # ---- v1.2: upload dedupe (same bytes, ?dedupe=1 -> reuse newest matching id)
     r = requests.post(f"{s}/file?dedupe=1", timeout=T, headers=auth,
                       files={"file": (name, payload)})
-    dd = r.json() if r.status_code in (200, 201) else {}
+    dd = jval(r) if r.status_code in (200, 201) else {}
     check("dedupe=1 = 200 existing id, nothing written",
           r.status_code == 200 and dd.get("status") == "existing" and dd.get("deduped") is True
           and dd.get("bytes_stored") is False and dd.get("file_id") in fl.get("files", {}),
           r.text[:160])
     r = requests.post(f"{s}/file", timeout=T, headers=auth, files={"file": (name, payload)})
     check("dedupe is opt-in: no flag still mints a new id",
-          r.status_code == 201 and r.json().get("status") == "stored", r.text[:120])
+          r.status_code == 201 and jval(r).get("status") == "stored", r.text[:120])
 
     # ---- v1.2: result correlation
     r = requests.get(f"{s}/result/not-a-real-msg-id", timeout=T, headers=auth)
     check("GET /result/<unknown> = 404 + hint",
-          r.status_code == 404 and "hint" in r.json(), r.text[:100])
+          r.status_code == 404 and "hint" in jval(r), r.text[:100])
 
     # ---- v1.2: per-agent event feed (no log secret needed)
     r = requests.get(f"{s}/events/mine", timeout=T,
@@ -240,7 +354,7 @@ def main() -> int:
     check("events/mine without X-Agent-Id = 400",
           r.status_code == 400 and "X-Agent-Id" in r.text, r.text[:100])
     r = requests.get(f"{s}/events/mine?limit=20", timeout=T, headers=auth)
-    ev = r.json() if r.ok else {}
+    ev = jval(r) if r.ok else {}
     check("events/mine 200 + own rows only",
           r.ok and {"events", "count", "total_matching", "caller"} <= set(ev)
           and ev.get("caller") == "selftest"
@@ -266,24 +380,24 @@ def main() -> int:
     # ---- v1.4: unique agent_id pre-flight
     free = "selftest-free-" + secrets.token_hex(3)
     r = requests.get(f"{s}/agent-id/{free}", timeout=T, headers=auth)
-    idst = r.json() if r.ok else {}
+    idst = jval(r) if r.ok else {}
     check("GET /agent-id/<free> = available + full keys",
           r.ok and idst.get("available") is True and idst.get("taken_by_sid") is None
           and {"agent_id", "connected_at", "standby_sockets", "last_rejection", "note"}
           <= set(idst), r.text[:140])
     r = requests.get(f"{s}/agent-id/bad%20id", timeout=T, headers=auth)
     check("GET /agent-id/<malformed> = 400 + pattern",
-          r.status_code == 400 and "pattern" in r.json(), r.text[:100])
+          r.status_code == 400 and "pattern" in jval(r), r.text[:100])
     r = requests.get(f"{s}/agent-id/selftest-NOT-CONNECTED", timeout=T, headers=auth)
     check("unknown id = 200 available:true (never a 404 dead end)",
-          r.status_code == 200 and r.json().get("available") is True, r.text[:100])
+          r.status_code == 200 and jval(r).get("available") is True, r.text[:100])
     check("manifest documents the v1.4 endpoint + uniqueness footgun",
           "/agent-id/{agent_id}" in paths and "unique since v1.4" in fg
           and "force_takeover" in fg, str(sorted(paths))[:120])
 
     # ---- inbox semantics (idle agent, peek must be non-destructive)
     r = requests.get(f"{s}/agent/selftest-idle/inbox?peek=true", timeout=T, headers=auth)
-    ib = r.json() if r.ok else {}
+    ib = jval(r) if r.ok else {}
     check("inbox peek 200 + new keys",
           r.ok and {"messages", "count", "drained", "queue_max", "agent_online",
                     "peek"} <= set(ib) and ib.get("peek") is True and ib.get("drained") is False,
@@ -293,10 +407,10 @@ def main() -> int:
     dl = requests.get(f"{s}/tasks/dead-letter", timeout=T, headers=auth)
     check("GET /tasks/dead-letter 200 + triage keys",
           dl.ok and {"count", "tasks", "states", "ledger_rows", "outstanding_by_agent",
-                     "expired_total", "ttl_seconds", "newest_last"} <= set(dl.json()),
+                     "expired_total", "ttl_seconds", "newest_last"} <= set(jval(dl)),
           dl.text[:140])
     ag = requests.get(f"{s}/agents", timeout=T, headers=auth)
-    agj = ag.json() if ag.ok else {}
+    agj = jval(ag) if ag.ok else {}
     det = agj.get("detail") or {}
     check("GET /agents carries the v1.5 ledger summary",
           ag.ok and {"task_ledger", "last_seen_note", "stranded_note"} <= set(agj)
@@ -306,10 +420,9 @@ def main() -> int:
         check("agents detail carries last_seen + queue depth + outstanding tasks",
               all({"last_seen", "inbox_backlog", "outstanding_tasks"} <= set(v)
                   for v in det.values()), str(list(det.values())[:1])[:160])
+    r = requests.get(f"{s}/result/neverissued0", timeout=T, headers=auth)
     check("GET /result/<never issued> 404 points at the ledger, not the eviction window",
-          requests.get(f"{s}/result/neverissued0", timeout=T, headers=auth).status_code == 404
-          and "/tasks/dead-letter" in requests.get(f"{s}/result/neverissued0",
-                                                   timeout=T, headers=auth).json().get("hint", ""),
+          r.status_code == 404 and "/tasks/dead-letter" in jval(r).get("hint", ""),
           "hint should name the dead-letter route")
     badhdr = {"Accept": "application/json", "ngrok-skip-browser-warning": "true"}
     for bad in ("not-a-credential", "agenta.shortepoch." + "0" * 64, "a.b.c"):
@@ -319,7 +432,7 @@ def main() -> int:
     check("manifest documents both principals and the credential-derived model",
           {"operator", "agent"} <= set(a.get("principals") or {})
           and "credential" in str(a.get("model", "")), str(a)[:160])
-    h2 = requests.get(f"{s}/health", timeout=T).json()
+    h2 = jval(requests.get(f"{s}/health", timeout=T))
     check("health advertises the v1.5 features",
           {"task_ledger", "dead_letter_queue", "agent_last_seen", "agent_credentials",
            "scoped_reads", "operator_principal"} <= set(h2.get("features", [])),
@@ -340,7 +453,7 @@ def main() -> int:
     if args.logtoken:
         r = requests.get(f"{s}/logs/{args.logtoken}/events.json?limit=5", timeout=T)
         check("events.json 200 structured",
-              r.ok and {"events", "count", "total", "newest_last"} <= set(r.json()), r.text[:120])
+              r.ok and {"events", "count", "total", "newest_last"} <= set(jval(r)), r.text[:120])
 
     # ---- v1.5.2: /logs token check must not 500 on non-ASCII (compare_digest TypeError)
     h404 = {"ngrok-skip-browser-warning": "true"}
@@ -405,7 +518,7 @@ def main() -> int:
                 r = requests.post(f"{s}/agent/{probe_b}/message", timeout=T + 15,
                                   headers={**hdr, "X-Agent-Token": alice_box["cred"]},
                                   json={"text": "selftest caller-read probe"})
-                m = r.json() if r.ok else {}
+                m = jval(r) if r.ok else {}
                 mid = m.get("msg_id", "")
                 check("agent principal can POST a task",
                       r.ok and m.get("status") == "replied"
@@ -413,7 +526,7 @@ def main() -> int:
                       r.text[:160])
                 r = requests.get(f"{s}/result/{mid}", timeout=T,
                                  headers={**hdr, "X-Agent-Token": alice_box["cred"]})
-                row = r.json() if r.ok else {}
+                row = jval(r) if r.ok else {}
                 check("caller's GET /result/<msg_id> is its own readable row (200, not 403)",
                       r.status_code == 200 and row.get("from") == f"agent:{probe_a}"
                       and len(row.get("results", [])) >= 1, r.text[:160])
@@ -460,10 +573,10 @@ def main() -> int:
                 t.start()
             time.sleep(2.5)
             r = requests.get(f"{s}/agent-id/{dup_id}", timeout=T, headers=auth)
-            st_mid = r.json() if r.ok else {}
+            st_mid = jval(r) if r.ok else {}
             done.wait(timeout=45)
             r = requests.get(f"{s}/agent-id/{dup_id}", timeout=T, headers=auth)
-            st = r.json() if r.ok else {}
+            st = jval(r) if r.ok else {}
             check("duplicate-id storm: exactly one socket registered",
                   len(accepted) == 1 and len(refused) == 7,
                   f"accepted={len(accepted)} refused={len(refused)}")
@@ -490,14 +603,14 @@ def main() -> int:
                 time.sleep(0.4)
                 r = requests.get(f"{s}/events/mine", timeout=T,
                                  headers={**hdr, "X-Agent-Token": one_box["cred"]})
-                ev1 = r.json() if r.ok else {}
+                ev1 = jval(r) if r.ok else {}
                 leaked = [e for e in ev1.get("events", [])
                           if marker in e.get("payload", "") + e.get("payload_full", "")]
                 check("short-id agent does NOT see the longer-id peer's traffic",
                       r.ok and not leaked, f"leaked {len(leaked)} rows: {str(leaked)[:120]}")
                 r = requests.get(f"{s}/events/mine", timeout=T,
                                  headers={**hdr, "X-Agent-Token": two_box["cred"]})
-                ev2 = r.json() if r.ok else {}
+                ev2 = jval(r) if r.ok else {}
                 own = [e for e in ev2.get("events", [])
                        if marker in e.get("payload", "") + e.get("payload_full", "")]
                 check("longer-id agent still sees its OWN traffic (positive control)",
@@ -511,7 +624,7 @@ def main() -> int:
                 time.sleep(0.4)
                 r = requests.get(f"{s}/events/mine?limit=50", timeout=T,
                                  headers={**hdr, "X-Agent-Token": two_box["cred"]})
-                rows = r.json().get("events", []) if r.ok else []
+                rows = jval(r).get("events", []) if r.ok else []
                 row = next((e for e in rows if tail in str(e.get("payload_full", ""))), None)
                 check("events/mine row carries payload_full beyond the 160-char clip",
                       row is not None and tail in row["payload_full"],
@@ -524,7 +637,7 @@ def main() -> int:
                 rr = requests.post(f"{s}/file", timeout=T,
                                    headers={**hdr, "X-Agent-Token": one_box["cred"]},
                                    files={"file": ("one-owned.json", own_bytes)})
-                fid_own = rr.json().get("file_id", "") if rr.status_code in (200, 201) else ""
+                fid_own = jval(rr).get("file_id", "") if rr.status_code in (200, 201) else ""
                 r = requests.delete(f"{s}/file/{fid_own}", timeout=T,
                                     headers={**hdr, "X-Agent-Token": two_box["cred"]})
                 check("peer agent gets 403 deleting another agent's upload",
@@ -532,7 +645,7 @@ def main() -> int:
                 r = requests.delete(f"{s}/file/{fid_own}", timeout=T,
                                     headers={**hdr, "X-Agent-Token": one_box["cred"]})
                 check("uploader agent deletes its own file (200)",
-                      r.status_code == 200 and r.json().get("status") == "deleted",
+                      r.status_code == 200 and jval(r).get("status") == "deleted",
                       r.text[:120])
             finally:
                 one_cli.disconnect(); two_cli.disconnect()
@@ -541,19 +654,19 @@ def main() -> int:
     # ---- optional live round-trip
     if args.agent:
         r = requests.get(f"{s}/agent-id/{args.agent}", timeout=T, headers=auth)
-        st = r.json() if r.ok else {}
+        st = jval(r) if r.ok else {}
         check(f"GET /agent-id/'{args.agent}' reports taken + holder sid",
               r.ok and st.get("available") is False and st.get("taken_by_sid")
               and isinstance(st.get("standby_sockets"), int) and st.get("connected_at"),
               r.text[:140])
         r = requests.post(f"{s}/agent/{args.agent}/message", timeout=T + 40,
                           headers=auth, json={"text": "selftest ping"})
-        m = r.json() if r.ok else {}
+        m = jval(r) if r.ok else {}
         check(f"task round-trip to '{args.agent}' replies",
               r.ok and m.get("status") == "replied" and m.get("reply"), r.text[:120])
         mid = m.get("msg_id", "")
         r = requests.get(f"{s}/result/{mid}", timeout=T, headers=auth)
-        res = r.json() if r.ok else {}
+        res = jval(r) if r.ok else {}
         # An auto-reply agent emits ACK (kind=ack) + the real answer, so results may have
         # more than one entry and results[-1] (the answer) != m["reply"] (the ACK text the
         # POST returned).  Accept: the POST's reply text appears in *any* result entry.
@@ -573,11 +686,11 @@ def main() -> int:
         r = requests.get(f"{s}/events/mine", timeout=T,
                          headers={**auth, "X-Agent-Id": args.agent})
         check(f"events/mine as '{args.agent}' shows the task",
-              r.ok and any(mid in e.get("payload", "") for e in r.json().get("events", [])),
+              r.ok and any(mid in e.get("payload", "") for e in jval(r).get("events", [])),
               r.text[:160])
         if args.logtoken:
             r = requests.get(f"{s}/logs/{args.logtoken}/events.json?limit=3000", timeout=T)
-            rows = [e for e in (r.json().get("events") if r.ok else []) or []
+            rows = [e for e in (jval(r).get("events") if r.ok else []) or []
                     if mid in e.get("payload", "") and e.get("event") == "MSG_RCVD"]
             # An auto-reply agent emits ACK + real answer, so there may be 2 MSG_RCVD rows.
             # What matters is at least 1; zero would mean the result was silently swallowed.
@@ -587,13 +700,13 @@ def main() -> int:
         # label comes from which credential authenticated
         r = requests.post(f"{s}/agent/{args.agent}/message?wait=0", timeout=T, headers=auth,
                           json={"text": "selftest ledger probe"})
-        led = r.json() if r.ok else {}
+        led = jval(r) if r.ok else {}
         mid2 = led.get("msg_id", "")
         check("POST wait=0 answers with the ledger handle",
               r.ok and led.get("task_state") in ("delivered", "acked")
               and led.get("result_endpoint") == f"/result/{mid2}", r.text[:160])
         r = requests.get(f"{s}/result/{mid2}", timeout=T, headers=auth)
-        row = r.json() if r.ok else {}
+        row = jval(r) if r.ok else {}
         check("the task is readable as a ledger row (state + deadline), not a 404",
               r.ok and row.get("state") in ("delivered", "acked", "answered")
               and row.get("deadline_at") and row.get("delivered_at")
@@ -601,7 +714,7 @@ def main() -> int:
         check("an operator-token call is labeled operator, never agent",
               str(row.get("from", "")).startswith("operator:"), str(row.get("from")))
         r = requests.get(f"{s}/tasks/dead-letter", timeout=T, headers=auth)
-        dlj = r.json() if r.ok else {}
+        dlj = jval(r) if r.ok else {}
         check("the waiting task shows up as outstanding for this agent",
               dlj.get("outstanding_by_agent", {}).get(args.agent, 0) >= 1
               or dlj.get("states", {}).get("answered", 0) >= 1, str(dlj)[:180])
@@ -611,7 +724,7 @@ def main() -> int:
     # DISK is allowed and delaying a RENDER is not. Burst enough offline relays that every one
     # logs a row with a unique agent id, then demand the newest in both readers immediately.
     burst = [f"stburst-{secrets.token_hex(3)}-{i}" for i in range(40)]
-    hm0 = (requests.get(f"{s}/health", timeout=T).json() or {}).get("log_mirror") or {}
+    hm0 = jval(requests.get(f"{s}/health", timeout=T)).get("log_mirror") or {}
     t0 = time.time()
     for bid in burst:
         requests.post(f"{s}/relay", headers=auth, timeout=T, json={"to": bid, "text": "x"})
@@ -622,10 +735,10 @@ def main() -> int:
         check("freshness: newest event is in the /logs page on read (render is not deferred)",
               page.ok and newest in page.text, f"{page.status_code} '{newest}' absent")
         ej = requests.get(f"{s}/logs/{args.logtoken}/events.json?limit=3000", timeout=T)
-        rows = (ej.json().get("events") if ej.ok else []) or []
+        rows = (jval(ej).get("events") if ej.ok else []) or []
         check("freshness: newest event is in events.json on read",
               ej.ok and any(e.get("agent") == newest for e in rows), f"{len(rows)} rows")
-    hm1 = (requests.get(f"{s}/health", timeout=T).json() or {}).get("log_mirror") or {}
+    hm1 = jval(requests.get(f"{s}/health", timeout=T)).get("log_mirror") or {}
     if hm1.get("interval_seconds", 0) > 0:
         bound = int(elapsed / hm1["interval_seconds"]) + 3
         delta = hm1.get("writes", 0) - hm0.get("writes", 0)
@@ -639,10 +752,10 @@ def main() -> int:
     # pre-index whole-ring scan) must still be a superset - the index may not lose a row.
     ie = requests.get(f"{s}/events/mine?limit=500", headers={**auth, "X-Agent-Id": newest},
                       timeout=T)
-    ij = ie.json() if ie.ok else {}
+    ij = jval(ie) if ie.ok else {}
     me = requests.get(f"{s}/events/mine?limit=500&mentions=1",
                       headers={**auth, "X-Agent-Id": newest}, timeout=T)
-    mj = me.json() if me.ok else {}
+    mj = jval(me) if me.ok else {}
     check("events/mine index carries the caller's own row without a log secret",
           ie.ok and any(e.get("agent") == newest for e in ij.get("events", [])),
           str(ij)[:160])
@@ -653,10 +766,10 @@ def main() -> int:
     # has to say which case it is, or a caller cannot tell a slow path from a lost bucket.
     fresh = f"stidx-{secrets.token_hex(3)}"
     requests.post(f"{s}/relay", headers=auth, timeout=T, json={"to": fresh, "text": "index me"})
-    fj = requests.get(f"{s}/events/mine", headers={**auth, "X-Agent-Id": fresh},
-                      timeout=T).json()
-    ghost = requests.get(f"{s}/events/mine", headers={**auth, "X-Agent-Id": "stidx-never-seen"},
-                         timeout=T).json()
+    fj = jval(requests.get(f"{s}/events/mine", headers={**auth, "X-Agent-Id": fresh},
+                           timeout=T))
+    ghost = jval(requests.get(f"{s}/events/mine",
+                              headers={**auth, "X-Agent-Id": "stidx-never-seen"}, timeout=T))
     check("events/mine says whether this caller is index-backed (indexed=true for a live id)",
           fj.get("indexed") is True and fj.get("total_matching", 0) >= 1, str(fj)[:150])
     check("events/mine reports indexed=false rather than a silent empty feed",
@@ -666,23 +779,23 @@ def main() -> int:
     payload = json.dumps({"selftest": secrets.token_hex(3)}).encode()
     up = requests.post(f"{s}/file", headers=auth, timeout=T,
                        files={"file": ("st-ids.json", payload)})
-    fid = (up.json() or {}).get("file_id", "") if up.status_code in (200, 201) else ""
+    fid = jval(up).get("file_id", "") if up.status_code in (200, 201) else ""
     one = requests.get(f"{s}/files?ids={fid}", headers=auth, timeout=T)
-    oj = one.json() if one.ok else {}
+    oj = jval(one) if one.ok else {}
     check("GET /files?ids=<one> answers with exactly that row plus total_matching",
           bool(fid) and one.ok and oj.get("count") == 1 and fid in (oj.get("files") or {})
           and "total_matching" in oj, str(oj)[:160])
     lim = requests.get(f"{s}/files?limit=1", headers=auth, timeout=T)
-    lj = lim.json() if lim.ok else {}
+    lj = jval(lim) if lim.ok else {}
     check("GET /files?limit=1 trims and says it trimmed",
           lim.ok and lj.get("count") == 1 and lj.get("trimmed") is True, str(lj)[:160])
     whole = requests.get(f"{s}/files", headers=auth, timeout=T)
-    wj = whole.json() if whole.ok else {}
+    wj = jval(whole) if whole.ok else {}
     check("GET /files with no params keeps the legacy shape (whole table, no trim keys)",
           whole.ok and fid in (wj.get("files") or {}) and "trimmed" not in wj, str(wj)[:120])
 
     # pain (e): a documented key list that has drifted from the response is worse than none.
-    man = requests.get(f"{s}/api", headers=auth, timeout=T).json()
+    man = jval(requests.get(f"{s}/api", headers=auth, timeout=T))
 
     def declared(method, path):
         for e in man.get("endpoints", []):
@@ -692,11 +805,11 @@ def main() -> int:
 
     drift = requests.post(f"{s}/file", headers=auth, timeout=T,
                           files={"file": ("st-drift.json", payload)})
-    got = set((drift.json() or {}).keys()) if drift.status_code in (200, 201) else set()
+    got = set(jval(drift)) if drift.status_code in (200, 201) else set()
     undeclared = sorted(got - declared("POST", "/file") - {"docs", "api", "hint"})
     check("POST /file answers only with keys /api declares (pain: doc drift)",
           bool(got) and not undeclared, f"undeclared: {undeclared}")
-    hk = set(requests.get(f"{s}/health", timeout=T).json())
+    hk = set(jval(requests.get(f"{s}/health", timeout=T)))
     check("/health answers only with keys /api declares",
           hk and not sorted(hk - declared("GET", "/health")),
           f"undeclared: {sorted(hk - declared('GET', '/health'))}")
@@ -708,4 +821,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except KeyboardInterrupt:
+        print("\nERROR  interrupted", file=sys.stderr)
+        rc = 130
+    except Exception as e:
+        if os.environ.get("SELFTEST_DEBUG"):
+            raise
+        rc = bail(f"selftest stopped after {len(PASS) + len(FAIL)} checks",
+                  f"{type(e).__name__}: {one_line(e, 200)}",
+                  f"{len(PASS)} passed, {len(FAIL)} failed before the stop.",
+                  "The run ended on an error, not a failed check: re-run with SELFTEST_DEBUG=1 "
+                  "for the traceback, and report which line stopped it.")
+    sys.exit(rc)
