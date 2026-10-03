@@ -146,9 +146,10 @@ def hub_verdict(base: str) -> str:
             f"is the problem here")
 
 
-def emit(r: "requests.Response") -> None:
+def emit(r: "requests.Response") -> bool:
     """Print a hub response without ever crashing on non-JSON bodies
-    (ngrok interstitial, HTML 401 page, etc.)."""
+    (ngrok interstitial, HTML 401 page, etc.). Returns True if 2xx."""
+    ok = r.ok
     try:
         print(json.dumps(r.json(), indent=2))
     except ValueError:
@@ -160,15 +161,23 @@ def emit(r: "requests.Response") -> None:
                   ' "ngrok-skip-browser-warning: true"')
         elif r.status_code == 401:
             print('hint: add -H "Authorization: Bearer <AGENT_AUTH_TOKEN>" ; docs: GET /llms.txt')
+    return ok
 
 
 class Agent:
     def __init__(self, server: str, agent_id: str, token: str, quiet: bool = False,
-                 force: bool = False, no_credential_file: bool = False):
+                 force: bool = False, no_credential_file: bool = False,
+                 on_task=None, on_peer_msg=None, on_file_ready=None,
+                 auto_reply: bool = False, exec_cmd: str = ""):
         self.server, self.agent_id, self.token = server, agent_id, token
         self.force = force
         self.base = http_base(server)
         self.quiet = quiet
+        self.on_task = on_task
+        self.on_peer_msg = on_peer_msg
+        self.on_file_ready = on_file_ready
+        self.auto_reply = auto_reply
+        self.exec_cmd = exec_cmd
         self.state = STATE_ROOT / agent_id
         (self.state / "downloads").mkdir(parents=True, exist_ok=True)
         self.inbox = self.state / "inbox.jsonl"
@@ -361,11 +370,22 @@ class Agent:
                 self.sio.emit("result", {"msg_id": data.get("msg_id"), "kind": "ack",
                                          "text": f"ACK[{self.agent_id}] task received {now()}"},
                               namespace="/agents")
+                self._dispatch_task_response(data)
             elif ev == "peer_msg":
                 self._write_inbox({"type": "peer_msg", "from": data.get("from"),
                                    "text": data.get("text")})
+                if self.on_peer_msg:
+                    try:
+                        self.on_peer_msg(data, self)
+                    except Exception as exc:
+                        self._log(f"[{now()}] on_peer_msg error: {exc}")
             elif ev == "file_ready":
-                self._download_file(data)
+                file_info = self._download_file(data)
+                if self.on_file_ready and file_info:
+                    try:
+                        self.on_file_ready(file_info, self)
+                    except Exception as exc:
+                        self._log(f"[{now()}] on_file_ready error: {exc}")
             elif ev in ("superseded", "reactivated"):
                 mine = self.sio.get_sid(namespace="/agents")
                 if ev == "superseded":
@@ -385,20 +405,86 @@ class Agent:
                                            f"{'re-registered elsewhere' if ev == 'superseded' else 'routing restored'}"})
         return handle
 
-    # ---------------- file download (agent pulls through ngrok, NAT-safe)
-    def _download_file(self, meta: dict) -> None:
-        url = f"{self.base}/file/{meta['file_id']}"
-        r = requests.get(url, headers=self._auth_headers(), timeout=30)
-        if r.status_code != 200:
-            self._write_inbox({"type": "file_error", "file_id": meta["file_id"],
-                               "status": r.status_code})
+    def _dispatch_task_response(self, data: dict) -> None:
+        msg_id = data.get("msg_id")
+        text = str(data.get("text") or "")
+        if self.on_task:
+            def _run():
+                try:
+                    res = self.on_task(data, self)
+                    if res is not None:
+                        self.reply(msg_id, str(res))
+                except Exception as exc:
+                    self._log(f"[{now()}] on_task error: {exc}")
+                    self.reply(msg_id, f"ERROR[{self.agent_id}]: {exc}")
+            threading.Thread(target=_run, daemon=True).start()
             return
+        if self.exec_cmd:
+            def _run_cmd():
+                try:
+                    import subprocess
+                    proc = subprocess.run(
+                        self.exec_cmd, shell=True, input=json.dumps(data),
+                        text=True, capture_output=True, timeout=60
+                    )
+                    out = proc.stdout.strip() if proc.returncode == 0 else f"EXEC_FAIL (rc={proc.returncode}): {proc.stderr.strip()}"
+                    self.reply(msg_id, out or "OK")
+                except Exception as exc:
+                    self._log(f"[{now()}] exec_cmd error: {exc}")
+                    self.reply(msg_id, f"EXEC_ERROR: {exc}")
+            threading.Thread(target=_run_cmd, daemon=True).start()
+            return
+        if self.auto_reply:
+            def _run_auto():
+                reply_text = self._compute_auto_reply(text, data)
+                self.reply(msg_id, reply_text)
+            threading.Thread(target=_run_auto, daemon=True).start()
+
+    def _compute_auto_reply(self, text: str, data: dict) -> str:
+        try:
+            val = json.loads(text)
+            if isinstance(val, dict):
+                action = val.get("action")
+                if action == "ping":
+                    return json.dumps({"status": "pong", "agent": self.agent_id, "time": now()})
+                if action == "echo":
+                    return str(val.get("message") or "")
+                if action == "compute":
+                    expr = str(val.get("expr") or "0")
+                    safe_dict = {"__builtins__": None, "abs": abs, "min": min, "max": max, "sum": sum, "round": round}
+                    return str(eval(expr, safe_dict, {}))  # noqa: S307
+        except Exception:
+            pass
+        return f"Completed task from {data.get('from')}: '{text}' (agent {self.agent_id})"
+
+    # ---------------- file download (agent pulls through ngrok, NAT-safe)
+    def _download_file(self, meta: dict) -> dict:
+        file_id = meta.get("file_id", "")
+        url = f"{self.base}/file/{file_id}"
+        try:
+            r = requests.get(url, headers=self._auth_headers(), timeout=30)
+        except requests.exceptions.RequestException as exc:
+            self._write_inbox({"type": "file_error", "file_id": file_id, "error": str(exc)})
+            return {}
+        if r.status_code != 200:
+            self._write_inbox({"type": "file_error", "file_id": file_id,
+                               "status": r.status_code})
+            return {}
         sha = hashlib.sha256(r.content).hexdigest()
-        path = self.state / "downloads" / meta["name"]
-        path.write_bytes(r.content)
-        self._write_inbox({"type": "file", "file_id": meta["file_id"], "name": meta["name"],
-                           "path": str(path), "size": len(r.content),
-                           "sha_ok": sha == meta.get("sha256")})
+        raw_name = meta.get("name") or f"{file_id}.bin"
+        safe_name = os.path.basename(raw_name) or f"{file_id}.bin"
+        path = self.state / "downloads" / safe_name
+        try:
+            path.write_bytes(r.content)
+        except OSError as exc:
+            self._write_inbox({"type": "file_error", "file_id": file_id, "name": safe_name,
+                               "error": f"write failed: {exc}"})
+            return {}
+        info = {"type": "file", "file_id": file_id, "name": safe_name,
+                "path": str(path), "size": len(r.content),
+                "sha_ok": sha == meta.get("sha256")}
+        self._write_inbox(info)
+        return info
 
     def _auth_headers(self) -> dict:
         # X-Agent-Id goes along as a label, but once the hub has minted a credential the hub
@@ -407,6 +493,78 @@ class Agent:
                 "X-Agent-Id": self.agent_id,
                 "Accept": "application/json",
                 "ngrok-skip-browser-warning": "true"}
+
+    # ---------------- programmatic API helpers
+    def reply(self, msg_id: str, text: str, kind: str = "") -> None:
+        """Answer a pending task directly via Socket.IO."""
+        payload = {"msg_id": msg_id, "text": text}
+        if kind:
+            payload["kind"] = kind
+        self.sio.emit("result", payload, namespace="/agents")
+        self._write_inbox({"type": "sent_reply", "msg_id": msg_id, "text": text})
+
+    def send_to_agent(self, to: str, text: str, timeout: float = 8.0) -> dict:
+        """Relay a message to another connected agent over Socket.IO."""
+        try:
+            ack = self.sio.call("agent_to_agent", {"to": to, "text": text},
+                                namespace="/agents", timeout=timeout)
+            self._write_inbox({"type": "relay_ack", "to": to, "ack": ack})
+            return ack if isinstance(ack, dict) else {"status": "relayed", "to": to}
+        except Exception as exc:
+            self._write_inbox({"type": "relay_error", "to": to, "error": str(exc)})
+            return {"error": str(exc), "to": to}
+
+    def send_to_client(self, text: str, msg_id: str = "") -> None:
+        """Send a note to client (queued on GET /agent/<id>/inbox)."""
+        payload = {"text": text}
+        if msg_id:
+            payload["msg_id"] = msg_id
+        self.sio.emit("agent_to_client", payload, namespace="/agents")
+        self._write_inbox({"type": "sent_to_client", "msg_id": msg_id, "text": text})
+
+    def upload_file(self, path: str | Path, to: str = "") -> dict:
+        """Upload a file to the hub and optionally notify a target agent."""
+        p = Path(path)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parent / p
+        if not p.is_file():
+            err = f"file not found: {p}"
+            self._write_inbox({"type": "upload_error", "path": str(p), "error": err})
+            return {"error": err, "status": 404}
+        headers = self._auth_headers()
+        if to:
+            headers["X-Target-Agent"] = to
+        try:
+            r = requests.post(f"{self.base}/file", headers=headers, timeout=30,
+                              files={"file": file_part(p)})
+            resp = r.json() if r.ok else {"error": r.text[:120], "status_code": r.status_code}
+            self._write_inbox({"type": "upload_ack", "name": p.name, "to": to,
+                               "status": r.status_code, "resp": resp})
+            return resp
+        except Exception as exc:
+            self._write_inbox({"type": "upload_error", "name": p.name, "error": str(exc)})
+            return {"error": str(exc), "status": 500}
+
+    def start_background(self) -> threading.Thread:
+        """Connect and start listening in a background daemon thread."""
+        t = threading.Thread(target=self.run_forever, daemon=True)
+        t.start()
+        t0 = time.time()
+        while time.time() - t0 < 5.0:
+            if self.sio.connected or not self.running:
+                break
+            time.sleep(0.1)
+        return t
+
+    def stop(self) -> None:
+        """Cleanly stop the agent and disconnect socket."""
+        self.deliberate_stop = True
+        self.running = False
+        try:
+            self.sio.disconnect()
+        except Exception:
+            pass
+        self._revoke_credential("agent stopped programmatically")
 
     # ---------------- outbox watcher: operator writes JSON actions here
     def _watch_outbox(self) -> None:
@@ -452,38 +610,43 @@ class Agent:
                 except json.JSONDecodeError:
                     self._log(f"[{now()}] OUTBOX bad json line: {line[:60]}")
                     continue
-                self._run_action(act)
+                try:
+                    self._run_action(act)
+                except Exception as exc:
+                    self._log(f"[{now()}] OUTBOX action '{act.get('action')}' failed: {exc}")
+                    self._write_inbox({"type": "outbox_error", "action": act.get("action"),
+                                       "error": str(exc), "act": act})
 
     def _run_action(self, act: dict) -> None:
         action = act.get("action")
         if action == "to_agent":
-            ack = self.sio.call("agent_to_agent", {"to": act["to"], "text": act["text"]},
-                                namespace="/agents", timeout=8)
-            self._write_inbox({"type": "relay_ack", "to": act["to"], "ack": ack})
+            to = str(act.get("to") or "")
+            text = str(act.get("text") or "")
+            if not to or not text:
+                self._write_inbox({"type": "outbox_error", "action": action,
+                                   "error": "missing 'to' or 'text'"})
+                return
+            self.send_to_agent(to, text)
         elif action == "to_client":
-            payload = {"text": act["text"]}
-            if act.get("msg_id"):
-                payload["msg_id"] = act["msg_id"]   # tags the task: GET /result/<msg_id> -> answered_via_inbox
-            self.sio.emit("agent_to_client", payload, namespace="/agents")
-            self._write_inbox({"type": "sent_to_client", "msg_id": act.get("msg_id"),
-                               "text": act["text"]})
+            text = str(act.get("text") or "")
+            msg_id = act.get("msg_id", "")
+            self.send_to_client(text, msg_id=msg_id)
         elif action == "reply":
-            self.sio.emit("result", {"msg_id": act.get("msg_id"), "text": act["text"]},
-                          namespace="/agents")
-            self._write_inbox({"type": "sent_reply", "msg_id": act.get("msg_id"),
-                               "text": act["text"]})
+            msg_id = str(act.get("msg_id") or "")
+            text = str(act.get("text") or "")
+            kind = str(act.get("kind") or "")
+            if not msg_id:
+                self._write_inbox({"type": "outbox_error", "action": action,
+                                   "error": "missing 'msg_id'"})
+                return
+            self.reply(msg_id, text, kind=kind)
         elif action == "upload":
-            p = Path(act["path"])
-            if not p.is_absolute():
-                p = Path(__file__).resolve().parent / p
-            data = p.read_bytes()
-            headers = self._auth_headers()
-            if act.get("to"):
-                headers["X-Target-Agent"] = act["to"]
-            r = requests.post(f"{self.base}/file", headers=headers, timeout=30,
-                              files={"file": file_part(p)})
-            self._write_inbox({"type": "upload_ack", "name": p.name, "to": act.get("to"),
-                               "status": r.status_code, "resp": r.json() if r.ok else r.text[:120]})
+            raw_path = act.get("path")
+            if not raw_path:
+                self._write_inbox({"type": "outbox_error", "action": action,
+                                   "error": "missing 'path'"})
+                return
+            self.upload_file(raw_path, to=act.get("to", ""))
         else:
             self._log(f"[{now()}] OUTBOX unknown action: {action}")
 
@@ -650,10 +813,25 @@ def main() -> None:
     ap.add_argument("--check-id", metavar="AGENT_ID", help="GET /agent-id/<id> and exit (is it free?)")
     ap.add_argument("--health", action="store_true", help="GET /health and exit")
     ap.add_argument("--docs", action="store_true", help="GET /llms.txt and exit")
+    ap.add_argument("--auto-reply", action="store_true",
+                    help="persistent mode: auto-reply to tasks with computed results instead of only ACKing")
+    ap.add_argument("--exec-cmd", metavar="COMMAND",
+                    help="persistent mode: execute shell command on task (receives task JSON on stdin, stdout is reply)")
+    ap.add_argument("--result", metavar="MSG_ID",
+                    help="GET /result/<msg_id> and exit (query task state & replies)")
+    ap.add_argument("--await-reply", action="store_true",
+                    help="with --message: poll GET /result/<msg_id> until answered or timeout")
+    ap.add_argument("--dead-letter", action="store_true",
+                    help="GET /tasks/dead-letter and exit")
+    ap.add_argument("--events", action="store_true",
+                    help="GET /events/mine and exit")
+    ap.add_argument("--delete-file", metavar="FILE_ID",
+                    help="DELETE /file/<file_id> and exit")
     args = ap.parse_args()
 
     one_shot = any([args.message, args.inbox, args.relay_to, args.upload, args.download,
-                    args.agents, args.health, args.docs, args.check_id, args.credential])
+                    args.agents, args.health, args.docs, args.check_id, args.credential,
+                    args.result, args.dead_letter, args.events, args.delete_file])
     if args.use_credential and not (args.agent_id and args.agent_id != "operator"):
         ap.error("--use-credential needs the --agent-id whose credential to present "
                  "(env AGENT_ID) - a credential belongs to one named agent")
@@ -665,7 +843,8 @@ def main() -> None:
             ap.error("--agent-id is required for persistent mode (env: AGENT_ID)")
         args.agent_id = "operator"
     agent = Agent(args.server, args.agent_id, args.token, force=args.force_takeover,
-                  no_credential_file=args.no_credential_file)
+                  no_credential_file=args.no_credential_file,
+                  auto_reply=args.auto_reply, exec_cmd=args.exec_cmd or "")
 
     if args.credential:
         minted = agent.read_credential()
@@ -734,14 +913,48 @@ def main() -> None:
         print(r.text)
         return
     if args.health:
-        emit(requests.get(f"{agent.base}/health", headers=agent._auth_headers(), timeout=20))
+        ok = emit(requests.get(f"{agent.base}/health", headers=agent._auth_headers(), timeout=20))
+        if not ok:
+            sys.exit(1)
         return
     if args.agents:
-        emit(requests.get(f"{agent.base}/agents", headers=agent._auth_headers(), timeout=20))
+        ok = emit(requests.get(f"{agent.base}/agents", headers=agent._auth_headers(), timeout=20))
+        if not ok:
+            sys.exit(1)
         return
     if args.check_id:
-        emit(requests.get(f"{agent.base}/agent-id/{args.check_id}",
-                          headers=agent._auth_headers(), timeout=20))
+        ok = emit(requests.get(f"{agent.base}/agent-id/{args.check_id}",
+                               headers=agent._auth_headers(), timeout=20))
+        if not ok:
+            sys.exit(1)
+        return
+    if args.result:
+        ok = emit(requests.get(f"{agent.base}/result/{args.result}",
+                               headers=agent._auth_headers(), timeout=20))
+        actor_note()
+        if not ok:
+            sys.exit(1)
+        return
+    if args.dead_letter:
+        ok = emit(requests.get(f"{agent.base}/tasks/dead-letter",
+                               headers=agent._auth_headers(), timeout=20))
+        actor_note()
+        if not ok:
+            sys.exit(1)
+        return
+    if args.events:
+        ok = emit(requests.get(f"{agent.base}/events/mine",
+                               headers=agent._auth_headers(), timeout=20))
+        actor_note()
+        if not ok:
+            sys.exit(1)
+        return
+    if args.delete_file:
+        ok = emit(requests.delete(f"{agent.base}/file/{args.delete_file}",
+                                  headers=agent._auth_headers(), timeout=20))
+        actor_note()
+        if not ok:
+            sys.exit(1)
         return
     if args.message:
         url = f"{agent.base}/agent/{args.message}/message"
@@ -749,36 +962,70 @@ def main() -> None:
             url += f"?wait={args.wait}"
         r = requests.post(url, headers=agent._auth_headers(), timeout=75,
                           json={"text": args.text})
-        emit(r)
+        ok = emit(r)
+        msg_id = ""
         try:
-            if r.json().get("status") == "replied":
+            data = r.json()
+            msg_id = data.get("msg_id", "")
+            if data.get("status") == "replied" and not args.await_reply:
                 print("note: with mock_agent this is usually the instant ACK; the real answer "
-                      f"lands later - check: python3 mock_agent.py --inbox {args.message} --peek")
+                      f"lands later - check: python3 mock_agent.py --inbox {args.message} --peek "
+                      f"or add --await-reply to wait for the answer")
         except ValueError:
             pass
         actor_note()
+        if args.await_reply and msg_id:
+            print(f"[{now()}] waiting for final answer on /result/{msg_id} ...")
+            deadline = time.time() + (args.wait or 30.0)
+            answered = False
+            while time.time() < deadline:
+                time.sleep(1.0)
+                res = requests.get(f"{agent.base}/result/{msg_id}",
+                                   headers=agent._auth_headers(), timeout=10)
+                if res.ok:
+                    rj = res.json()
+                    if rj.get("state") == "answered" or len(rj.get("results", [])) > 1:
+                        print(f"[{now()}] task completed! Final result:")
+                        emit(res)
+                        answered = True
+                        break
+            if not answered:
+                print(f"[{now()}] timed out waiting for final answer on {msg_id}", file=sys.stderr)
+                sys.exit(1)
+        if not ok:
+            sys.exit(1)
         return
     if args.inbox:
         url = f"{agent.base}/agent/{args.inbox}/inbox"
         if args.peek:
             url += "?peek=true"
-        emit(requests.get(url, headers=agent._auth_headers(), timeout=20))
+        ok = emit(requests.get(url, headers=agent._auth_headers(), timeout=20))
         if not args.peek:
             print("note: GET /agent/<id>/inbox DRAINS AND CLEARS the queue (use --peek to inspect)")
+        if not ok:
+            sys.exit(1)
         return
     if args.relay_to:
-        emit(requests.post(f"{agent.base}/relay", headers=agent._auth_headers(), timeout=20,
-                           json={"to": args.relay_to, "text": args.text}))
+        ok = emit(requests.post(f"{agent.base}/relay", headers=agent._auth_headers(), timeout=20,
+                                json={"to": args.relay_to, "text": args.text}))
         actor_note()
+        if not ok:
+            sys.exit(1)
         return
     if args.upload:
         p = Path(args.upload)
+        if not p.is_file():
+            print(json.dumps({"error": f"local file '{args.upload}' not found",
+                              "path": str(p)}, indent=2), file=sys.stderr)
+            sys.exit(1)
         headers = agent._auth_headers()
         if args.to:
             headers["X-Target-Agent"] = args.to
-        emit(requests.post(f"{agent.base}/file", headers=headers, timeout=60,
-                           files={"file": file_part(p)}))
+        ok = emit(requests.post(f"{agent.base}/file", headers=headers, timeout=60,
+                                files={"file": file_part(p)}))
         actor_note()
+        if not ok:
+            sys.exit(1)
         return
     if args.download:
         r = requests.get(f"{agent.base}/file/{args.download}", headers=agent._auth_headers(),
@@ -789,12 +1036,15 @@ def main() -> None:
             files = requests.get(f"{agent.base}/files?ids={args.download}",
                                  headers=agent._auth_headers(), timeout=20).json().get("files", {})
             meta = files.get(args.download, {})
-            dest = agent.state / "downloads" / meta.get("name", f"{args.download}.bin")
+            name = os.path.basename(meta.get("name") or f"{args.download}.bin")
+            dest = agent.state / "downloads" / name
             dest.write_bytes(r.content)
             print(f"saved -> {dest} ({len(r.content)} B, sha_ok="
                   f"{hashlib.sha256(r.content).hexdigest() == meta.get('sha256')})")
         else:
             emit(r)
+            actor_note()
+            sys.exit(1)
         actor_note()
         return
     sys.exit(agent.run_forever())
