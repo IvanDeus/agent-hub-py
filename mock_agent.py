@@ -30,10 +30,12 @@ python3 mock_agent.py --health ; python3 mock_agent.py --docs   # /health, /llms
 import argparse
 import hashlib
 import json
+import mimetypes
 import os
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -43,6 +45,11 @@ import socketio
 STATE_ROOT = Path(os.environ.get("HUB_STATE_DIR")
                   or Path(__file__).resolve().parent / "state")
 
+# Keep retrying a dropped socket for this long before declaring the hub unreachable. Long
+# enough to ride out an ngrok edge flap or a hub restart, short enough that a permanently
+# wrong URL/superseded id surfaces as a dead process instead of an infinite quiet retry loop.
+RECONNECT_GIVEUP_AFTER = 300
+
 
 def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -50,6 +57,63 @@ def now() -> str:
 
 def http_base(server: str) -> str:
     return server.rstrip("/").split("/socket.io")[0]
+
+
+# The socket handshake is a plain HTTP GET, so ngrok's free tier intercepts it exactly like
+# any other call - and python-socketio then reports the HTML body as a JSON parse error.
+SOCKET_HEADERS = {"ngrok-skip-browser-warning": "true"}
+
+_PARSE_TELLS = ("expecting value", "jsondecodeerror", "no json object could be decoded",
+                "unexpected response from server", "unexpected status code", "char 0")
+
+
+def diagnose(detail: str) -> str:
+    """Turn a socket-failure string into the fix. python-socketio hands back 'Expecting
+    value: line 1 column 1 (char 0)' or 'Unexpected response from server', which is true,
+    complete and useless to whoever is staring at a dead agent."""
+    low = (detail or "").lower()
+    if any(t in low for t in _PARSE_TELLS):
+        return ("the hub answered the socket handshake with HTML instead of a Socket.IO "
+                "handshake. Two ways that happens: (a) ngrok's free-tier interstitial - this "
+                "client now sends 'ngrok-skip-browser-warning: true' on the socket too, so if "
+                "you are seeing it on an older client, upgrade it; (b) the tunnel URL is DEAD - "
+                "ngrok mints a NEW subdomain every time the hub restarts, and the old one "
+                "answers 404 with an HTML page forever. Get the current URL from the operator "
+                "or from GET /health on the hub host.")
+    if "401" in low or "unauthorized" in low:
+        return ("the hub refused the socket at HTTP level (401) - the token in "
+                "auth {'token': ...} is wrong for this hub.")
+    return ""
+
+
+def file_part(path: "Path") -> tuple:
+    """A multipart part that carries a real Content-Type. `requests` sends none unless you
+    hand it a 3-tuple, so every upload used to land in the hub's index as
+    `application/octet-stream` and `GET /files` told you nothing about what you stored."""
+    data = path.read_bytes()
+    return path.name, data, (mimetypes.guess_type(path.name)[0]
+                             or "application/octet-stream")
+
+
+def hub_verdict(base: str) -> str:
+    """One line on what the hub endpoint actually says right now, so an agent that lost its
+    socket can tell 'hub down' from 'URL stale' from 'hub fine, my socket is the problem'."""
+    try:
+        r = requests.get(base.rstrip("/") + "/health", headers=SOCKET_HEADERS, timeout=8)
+    except requests.exceptions.ConnectionError:
+        return f"nothing is listening at {base} - the hub process is down (or the URL is wrong)"
+    except Exception as exc:  # noqa: BLE001 - a probe never breaks the agent
+        return f"probe failed: {type(exc).__name__}: {exc}"
+    if r.status_code != 200:
+        kind = "ngrok's dead-URL page" if "ngrok" in r.text.lower() else "a non-hub answer"
+        return f"{base} answered HTTP {r.status_code} - {kind}; ask for the current URL"
+    try:
+        body = r.json()
+    except ValueError:
+        return f"{base} answered 200 with a non-JSON body - an intercepting proxy, not the hub"
+    return (f"the hub at {base} is ALIVE (v{body.get('version')}, "
+            f"{body.get('agents_connected')} agent(s) connected) - so the socket, not the hub, "
+            f"is the problem here")
 
 
 def emit(r: "requests.Response") -> None:
@@ -82,10 +146,59 @@ class Agent:
         self.sio = socketio.Client(reconnection=True, reconnection_attempts=0,
                                    reconnection_delay=2, request_timeout=15)
         self.running = True
+        self.deliberate_stop = False
+        self.last_refusal = ""
+        self.agent_token = ""      # per-agent credential minted by the hub at connect (v1.5)
         for ev in ("task", "peer_msg", "file_ready", "superseded", "reactivated"):
             self.sio.on(ev, self._make_handler(ev), namespace="/agents")
-        self.sio.on("connect", lambda: self._log(f"[{now()}] socket connected"))
-        self.sio.on("disconnect", lambda: self._log(f"[{now()}] socket disconnected"))
+        # The hub hands out a credential bound to this agent_id at connect. Every HTTP call this
+        # process makes presents it, so `from` is derived from which credential authenticated
+        # rather than from a header this process could type. A reconnect (or a take-over of the
+        # id) mints a new one and the old one stops working - revocation for free.
+        self.sio.on("agent_token", self._on_agent_token, namespace="/agents")
+        self.sio.on("connect", lambda *a: self._log(f"[{now()}] socket connected"))
+        # A drop is not an exit: python-socketio reconnects on its own thread, so say so out
+        # loud instead of letting the operator guess from a quiet process.
+        self.sio.on("disconnect", lambda *a: self._log(
+            f"[{now()}] socket disconnected - process staying alive, reconnecting in the "
+            f"background (a tunnel blip is not fatal)"))
+        # Only a namespace refusal lands here. A hub that is down or a URL that changed fails
+        # at the connection level and fires nothing at all, so run_forever times the outage
+        # itself rather than trusting this event to report it.
+        self.sio.on("connect_error", self._on_refused)
+        # ...and a reconnect that dies inside engineio's own thread fires no event either.
+        # Without this hook the exception goes to Python's default threading hook: a traceback
+        # nobody reads (or silence), while the process looks healthy.
+        self._install_thread_hook()
+
+    def _install_thread_hook(self) -> None:
+        me = self
+
+        def _hook(args):
+            text = f"{type(args.exc_value).__name__}: {args.exc_value}"
+            me.last_refusal = text[:160]
+            extra = diagnose(text)
+            me._log(f"[{now()}] BACKGROUND SOCKET THREAD failed: {text}"
+                    + (f"\n  - {extra}" if extra else ""))
+            if os.environ.get("HUB_DEBUG") == "1" and args.exc_traceback is not None:
+                traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+        threading.excepthook = _hook
+
+    def _on_refused(self, err=None, *_a) -> None:
+        self.last_refusal = str(err)[:160]
+        extra = diagnose(self.last_refusal)
+        self._log(f"[{now()}] RECONNECT REFUSED: {self.last_refusal}"
+                  + (f" - {extra}" if extra else " - still retrying"))
+
+    def _on_agent_token(self, data=None) -> None:
+        self.agent_token = str((data or {}).get("token", ""))
+        if self.agent_token:
+            self._log(f"[{now()}] CREDENTIAL issued for '{self.agent_id}': agent-scoped, sent as "
+                      f"X-Agent-Token on HTTP, revoked when this socket dies or the id is taken")
+        else:
+            self._log(f"[{now()}] no credential in the connect handshake - this hub predates "
+                      f"v1.5, using the hub token for HTTP")
 
     def _log(self, msg: str) -> None:
         if not self.quiet:
@@ -147,22 +260,49 @@ class Agent:
                            "sha_ok": sha == meta.get("sha256")})
 
     def _auth_headers(self) -> dict:
-        return {"X-Agent-Token": self.token, "X-Agent-Id": self.agent_id,
+        # X-Agent-Id goes along as a label, but once the hub has minted a credential the hub
+        # takes the caller's identity from that credential and ignores this header.
+        return {"X-Agent-Token": self.agent_token or self.token,
+                "X-Agent-Id": self.agent_id,
                 "Accept": "application/json",
                 "ngrok-skip-browser-warning": "true"}
 
     # ---------------- outbox watcher: operator writes JSON actions here
     def _watch_outbox(self) -> None:
-        pos = self.outbox.stat().st_size if self.outbox.exists() else 0
+        # Byte-offset tailing lost actions: a '>' redirect or an editor save makes the file
+        # shorter than the stored offset, so seek() landed past EOF (read '' - nothing ran) or
+        # mid-line (garbage json). Track the consumed *prefix* instead and notice rewrites.
+        consumed = b""
+        if self.outbox.exists():
+            try:
+                pre = self.outbox.read_bytes()
+            except OSError:
+                pre = b""
+            cut = pre.rfind(b"\n")
+            consumed = pre[:cut + 1] if cut >= 0 else b""
+            if consumed:
+                n = consumed.count(b"\n")
+                self._log(f"[{now()}] OUTBOX: ignoring {n} action line(s) queued before this "
+                          f"process started (they are not replayed)")
         while self.running:
             time.sleep(1.0)
-            if not self.outbox.exists():
+            try:
+                data = self.outbox.read_bytes()
+            except OSError:
                 continue
-            with self.outbox.open("r", encoding="utf-8") as f:
-                f.seek(pos)
-                new = f.read()
-                pos = f.tell()
-            for line in new.splitlines():
+            if consumed and not data.startswith(consumed):
+                self._log(f"[{now()}] OUTBOX was rewritten rather than appended - re-reading it "
+                          f"from the top; any action it already ran may run a second time")
+                consumed = b""
+            cut = data.rfind(b"\n")
+            if cut < 0:
+                continue                       # nothing complete to act on yet
+            body = data[:cut + 1]              # only consume whole lines
+            if len(body) <= len(consumed):
+                continue
+            new = body[len(consumed):]
+            consumed = body
+            for line in new.decode("utf-8", "replace").splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -200,7 +340,7 @@ class Agent:
             if act.get("to"):
                 headers["X-Target-Agent"] = act["to"]
             r = requests.post(f"{self.base}/file", headers=headers, timeout=30,
-                              files={"file": (p.name, data)})
+                              files={"file": file_part(p)})
             self._write_inbox({"type": "upload_ack", "name": p.name, "to": act.get("to"),
                                "status": r.status_code, "resp": r.json() if r.ok else r.text[:120]})
         else:
@@ -241,24 +381,62 @@ class Agent:
         if self.force:
             auth["force_takeover"] = True
         try:
-            self.sio.connect(self.base, namespaces=["/agents"], auth=auth, wait_timeout=15)
+            self.sio.connect(self.base, namespaces=["/agents"], auth=auth, wait_timeout=15,
+                             headers=SOCKET_HEADERS)
         except Exception as exc:  # noqa: BLE001 - surface auth errors clearly
             print(f"[{now()}] CONNECT FAILED (hub refused): {exc}\n"
-                  f"  - hub behind ngrok: send 'ngrok-skip-browser-warning' (clients here do)\n"
                   f"  - asking the hub why:", file=sys.stderr)
-            self._why_refused()
+            why = diagnose(str(exc))
+            if why:
+                print(f"  - {why}", file=sys.stderr)
+            verdict = hub_verdict(self.base)
+            print(f"  - right now: {verdict}", file=sys.stderr)
+            if "ALIVE" in verdict:      # only now is "who holds this id" a meaningful question
+                self._why_refused()
             return 2
         self._log(f"[{now()}] agent '{self.agent_id}' listening | "
                   f"inbox={self.inbox} | outbox={self.outbox}")
         self._write_inbox({"type": "hello", "text": f"{self.agent_id} online via {self.base}"})
         threading.Thread(target=self._watch_outbox, daemon=True).start()
         try:
-            while self.running and self.sio.connected:
+            down_since = None
+            told = ""
+            next_tell = 0.0
+            while self.running:
+                if self.sio.connected:
+                    down_since = None
+                    told = ""
+                else:
+                    down_since = down_since or time.time()
+                    # A reconnect that fails inside engineio's own thread fires no event at all,
+                    # so the outage would be silent for the whole give-up window. Ask the hub
+                    # directly and say what came back - once per verdict, not every tick.
+                    if time.time() - down_since >= 10 and time.time() >= next_tell:
+                        verdict = hub_verdict(self.base)
+                        next_tell = time.time() + 30
+                        if verdict != told:
+                            told = verdict
+                            self._log(f"[{now()}] SOCKET DOWN for "
+                                      f"{int(time.time() - down_since)}s - {verdict} "
+                                      f"(still retrying; giving up at "
+                                      f"{RECONNECT_GIVEUP_AFTER}s without it)")
+                    if time.time() - down_since >= RECONNECT_GIVEUP_AFTER:
+                        self._log(f"[{now()}] GIVING UP: no usable socket for "
+                                  f"{RECONNECT_GIVEUP_AFTER}s (last hub answer: "
+                                  f"{self.last_refusal or 'nothing - connection never opened'})"
+                                  f" - exiting nonzero so a supervisor restarts this agent")
+                        self.running = False
                 time.sleep(0.5)
         except KeyboardInterrupt:
+            self.deliberate_stop = True
             self.running = False
-            self.sio.disconnect()
-        return 0
+            try:
+                self.sio.disconnect()
+            except Exception:  # noqa: BLE001 - already gone is fine here
+                pass
+        # Only a Ctrl+C is a clean exit. Ending any other way means the socket was lost for
+        # good, and exit 0 would tell a supervisor "nothing to restart".
+        return 0 if self.deliberate_stop else 1
 
 
 # ---------------- one-shot HTTP helpers (no persistent socket needed)
@@ -346,7 +524,7 @@ def main() -> None:
         if args.to:
             headers["X-Target-Agent"] = args.to
         emit(requests.post(f"{agent.base}/file", headers=headers, timeout=60,
-                           files={"file": (p.name, p.read_bytes())}))
+                           files={"file": file_part(p)}))
         return
     if args.download:
         r = requests.get(f"{agent.base}/file/{args.download}", headers=agent._auth_headers(),
