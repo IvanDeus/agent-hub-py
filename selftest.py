@@ -28,7 +28,8 @@ REQUIRED_FEATURES = ["llms_txt", "api_manifest", "json_errors", "method_405",
                      "file_index", "events_json", "result_lookup", "events_mine",
                      "client_source", "dedupe_uploads", "superseded_notice",
                      "single_result_log_rows", "standby_takeover_chain",
-                     "result_inbox_status", "unique_agent_ids"]
+                     "result_inbox_status", "unique_agent_ids",
+                     "unread_nudge", "relay_queue"]
 
 PASS = []
 FAIL = []
@@ -105,8 +106,12 @@ def main() -> int:
     ap.add_argument("--agent", default="", help="an agent_id that is connected: live task round-trip")
     ap.add_argument("--socket", action="store_true",
                     help="run the live socket section (needs python-socketio): verifies the "
-                         "v1.4 duplicate-id refusal under concurrency and that a task caller "
-                         "can poll its own GET /result row with its agent credential")
+                         "v1.4 duplicate-id refusal under concurrency, that a task caller "
+                         "can poll its own GET /result row with its agent credential, the "
+                         "reconnect cycle (graceful drop -> blind window -> same-token rejoin on "
+                         "a freshly minted credential), and the v1.9 unread nudge (a missed file "
+                         "announced at connect, a relay to an offline agent queued rather than "
+                         "dropped, nothing ever named twice)")
     ap.add_argument("--timeout", type=float, default=20)
     args = ap.parse_args()
 
@@ -191,7 +196,11 @@ def main() -> int:
     check("llms.txt 200 markdown",
           r.ok and r.headers.get("content-type", "").startswith("text/markdown"),
           f"{r.status_code} {r.headers.get('content-type')}")
-    check("llms.txt sane size", 0 < len(llms) < 20000, f"{len(llms)} bytes")
+    # v1.9 moved this ceiling 20,000 -> 23,000: the unread notice is a whole socket event and the
+    # guard exists to catch runaway doc growth, not to keep the guide at an arbitrary size.
+    # `len(r.text)` counts CHARACTERS, not bytes - this render is 22,602 chars / 22,626 B, and
+    # labelling it "bytes" below is how a README claim once came out 24 B off its own arithmetic.
+    check("llms.txt sane size", 0 < len(llms) < 23000, f"{len(llms)} chars")
     drift = [e["path"] for e in manifest.get("endpoints", []) if e["path"] not in llms]
     check("docs drift: every /api path appears in /llms.txt", not drift, str(drift))
 
@@ -478,7 +487,7 @@ def main() -> int:
 
             def sconn(agent_id, responder=False):
                 cli = socketio.Client()
-                box = {"cred": None, "got": None, "tok": None}
+                box = {"cred": None, "got": None, "tok": None, "unread": [], "peers": []}
 
                 @cli.on("agent_token", namespace="/agents")
                 def _tok(d=None):
@@ -492,6 +501,17 @@ def main() -> int:
                         cli.emit("result", {"msg_id": (d or {}).get("msg_id"),
                                             "text": "selftest socket answer"},
                                  namespace="/agents")
+
+                # v1.9: the recovery notice and the relays it releases. A socket with no handler
+                # for an event silently drops it, which would make this section pass on nothing.
+                @cli.on("unread", namespace="/agents")
+                def _unread(d=None):
+                    box["unread"].append(d)
+
+                @cli.on("peer_msg", namespace="/agents")
+                def _peer(d=None):
+                    box["peers"].append(d)
+
                 cli.connect(s, namespaces=["/agents"],
                             auth={"token": args.token, "agent_id": agent_id},
                             wait_timeout=15, headers=hdr)
@@ -650,6 +670,246 @@ def main() -> int:
             finally:
                 one_cli.disconnect(); two_cli.disconnect()
             time.sleep(0.5)
+
+            # D) the reconnect cycle. A NAT agent loses its socket constantly (tunnel blip), and
+            #    an operator may cycle it on a timer, so the contract has two halves worth pinning
+            #    down together: the *connect* token is static and reusable, while the minted HTTP
+            #    credential is epoch-rotated per socket on purpose - revocation is immediate and
+            #    free. The offline gap is pinned too: a hub with no socket does not queue the
+            #    task, it answers 404, which is the one thing a cycling client must expect.
+            rec_id = f"st-recon-{suffix}"
+            first_cli, first_box = sconn(rec_id)
+            time.sleep(0.4)
+            cred1 = first_box["cred"]
+            r = requests.get(f"{s}/agents", timeout=T, headers={**hdr, "X-Agent-Token": cred1})
+            check("cycle: the live socket's credential authenticates over HTTP",
+                  bool(cred1) and r.ok, f"{r.status_code} {r.text[:110]}")
+            first_cli.disconnect()
+            time.sleep(0.8)
+            r = requests.get(f"{s}/agents", timeout=T, headers={**hdr, "X-Agent-Token": cred1})
+            check("cycle: that credential dies with the socket (401 = revocation for free)",
+                  r.status_code == 401, f"{r.status_code} {r.text[:110]}")
+            st = jval(requests.get(f"{s}/agent-id/{rec_id}", timeout=T, headers=auth))
+            check("cycle: a graceful disconnect frees the id (no stale socket, 0 standbys)",
+                  st.get("available") is True and not st.get("standby_sockets"),
+                  json.dumps(st)[:150])
+            r = requests.post(f"{s}/agent/{rec_id}/message", timeout=T, headers=auth,
+                              json={"text": "selftest during the gap"})
+            check("cycle: the gap is a blind window - offline 404s, nothing is queued",
+                  r.status_code == 404 and "offline" in jval(r).get("error", ""),
+                  f"{r.status_code} {r.text[:120]}")
+            time.sleep(1.0)
+            refusal = ""
+            try:
+                second_cli, second_box = sconn(rec_id, responder=True)
+            except Exception as exc:  # noqa: BLE001 - a refused reconnect is a finding, not a crash
+                second_cli, second_box, refusal = None, {"cred": None}, one_line(str(exc), 140)
+            time.sleep(0.4)
+            cred2 = (second_box or {}).get("cred")
+            check("cycle: same agent_id + same AGENT_AUTH_TOKEN reconnects unforced",
+                  second_cli is not None and second_cli.connected, refusal or "refused")
+            check("cycle: the new socket is handed a FRESH credential, never the old one",
+                  bool(cred2) and cred2 != cred1, f"same value reused: {str(cred2)[:60]}")
+            if cred2:
+                r = requests.get(f"{s}/agents", timeout=T,
+                                 headers={**hdr, "X-Agent-Token": cred2})
+                check("cycle: the fresh credential restores HTTP capability",
+                      r.ok, f"{r.status_code} {r.text[:110]}")
+                r = requests.get(f"{s}/agents", timeout=T,
+                                 headers={**hdr, "X-Agent-Token": cred1})
+                check("cycle: the retired credential stays dead even with a socket live",
+                      r.status_code == 401, f"{r.status_code} {r.text[:110]}")
+                ag2 = jval(requests.get(f"{s}/agents", timeout=T, headers=auth))
+                check("cycle: exactly one socket registered for the id after reconnect",
+                      ag2.get("agent_ids", []).count(rec_id) == 1,
+                      f"count={ag2.get('agent_ids', []).count(rec_id)} standby={ag2.get('standby')}")
+                r = requests.post(f"{s}/agent/{rec_id}/message", timeout=T + 15, headers=auth,
+                                  json={"text": "selftest post-reconnect routing"})
+                m = jval(r) if r.ok else {}
+                check("cycle: routing points at the new socket (task round-trip replies)",
+                      r.ok and m.get("status") == "replied"
+                      and (m.get("reply") or {}).get("text") == "selftest socket answer",
+                      r.text[:160])
+            if second_cli:
+                second_cli.disconnect()
+            time.sleep(0.5)
+
+            # E) the unread nudge (v1.9). Section D pinned what a gap costs: nothing is queued, so
+            #    everything aimed at the missing socket is simply lost. This checks the two things
+            #    the hub now owes an agent that rejoins - that it is *told* what it missed, and that
+            #    peer text is *held* instead of destroyed - and that being told happens once, not
+            #    every 45 seconds forever.
+            miss_id = f"st-miss-{suffix}"
+            miss_bytes = json.dumps({"for": miss_id, "n": secrets.token_hex(4)}).encode()
+            miss_sha = hashlib.sha256(miss_bytes).hexdigest()
+            r = requests.post(f"{s}/file", timeout=T,
+                              headers={**auth, "X-Target-Agent": miss_id},
+                              files={"file": ("missed.json", miss_bytes)})
+            up = jval(r) if r.status_code in (200, 201) else {}
+            miss_fid = up.get("file_id", "")
+            check("gap: upload for an offline target is stored and reports target_error",
+                  bool(miss_fid) and up.get("delivered") is False
+                  and "unread notice" in up.get("target_error", ""), r.text[:150])
+            hb = jval(requests.get(f"{s}/health", timeout=T))
+            check("gap: /health counts the file it now owes that agent",
+                  (hb.get("unread") or {}).get("files_unannounced", 0) >= 1,
+                  one_line(json.dumps(hb.get("unread")), 150))
+
+            miss_cli, miss_box = sconn(miss_id)
+            time.sleep(0.8)
+            notice = (miss_box["unread"] or [None])[-1]
+            check("nudge: the connect notice names the file nobody announced",
+                  notice is not None and notice.get("reason") == "connect"
+                  and (notice.get("unread") or {}).get("files", 0) >= 1
+                  and any(f.get("file_id") == miss_fid and f.get("sha256") == miss_sha
+                          for f in notice.get("files") or []),
+                  "no unread event" if notice is None else one_line(json.dumps(notice), 150))
+            listed = next((f for f in (notice or {}).get("files") or []
+                           if f.get("file_id") == miss_fid), {})
+            if listed.get("url"):
+                r = requests.get(f"{s}{listed['url']}", timeout=T,
+                                 headers={**hdr, "X-Agent-Token": miss_box["cred"]})
+                check("nudge: the credential pushed with the notice can fetch the missed file",
+                      r.status_code == 200 and r.content == miss_bytes,
+                      f"{r.status_code} {len(r.content)} B")
+            else:
+                check("nudge: the credential pushed with the notice can fetch the missed file",
+                      False, "no url in the notice")
+            miss_cli.disconnect()
+            time.sleep(1.0)
+
+            r = requests.post(f"{s}/relay", timeout=T, headers=auth,
+                              json={"to": miss_id, "text": "held for you, not dropped"})
+            q = jval(r) if r.ok else {}
+            check("relay: an offline target now gets status queued instead of 404",
+                  r.status_code == 200 and q.get("status") == "queued"
+                  and q.get("queue_depth") == 1 and q.get("msg_id"), r.text[:150])
+            miss2_cli, miss2_box = sconn(miss_id)
+            time.sleep(0.8)
+            n2 = (miss2_box["unread"] or [None])[-1]
+            peers = miss2_box["peers"]
+            check("relay: the queued text arrives as an ordinary peer_msg with its sender intact",
+                  any(p.get("text") == "held for you, not dropped"
+                      and str(p.get("from", "")).startswith("operator") for p in peers),
+                  one_line(json.dumps(peers), 150))
+            check("nudge: that same notice reports what it flushed",
+                  n2 is not None and (n2.get("unread") or {}).get("relays", 0) >= 1
+                  and n2.get("relays_flushed") == len(peers),
+                  "no unread event" if n2 is None else one_line(json.dumps(n2), 150))
+            check("nudge: an already-announced file is not announced twice",
+                  n2 is not None and not any(f.get("file_id") == miss_fid
+                                             for f in n2.get("files") or []),
+                  one_line(json.dumps((n2 or {}).get("files")), 120))
+            ag3 = jval(requests.get(f"{s}/agents", timeout=T, headers=auth))
+            det = (ag3.get("detail") or {}).get(miss_id) or {}
+            check("nudge: /agents detail carries the relay backlog beside the inbox one",
+                  "mail_backlog" in det and "inbox_backlog" in det, one_line(det, 140))
+            declared = json.dumps(manifest.get("endpoints", []))
+            check("nudge: /api declares every key the notice and /agents now answer with",
+                  "mail_backlog" in declared and "queued" in declared
+                  and "unread" in json.dumps((manifest.get("socket") or {}).get("hub_to_agent", {})),
+                  "")
+            miss2_cli.disconnect()
+            time.sleep(1.0)
+
+            # A task the agent never answered stays `delivered`, so it is the one unread item that
+            # has no durable body behind it: the hub hands back handles, never the text. Eleven of
+            # them prove the list is capped while the count stays honest.
+            nag_id = f"st-nag-{suffix}"
+            nag_cli, nag_box = sconn(nag_id)
+            time.sleep(0.5)
+            nag_ids = []
+            for i in range(11):
+                rr = requests.post(f"{s}/agent/{nag_id}/message?wait=0", timeout=T,
+                                   headers=auth, json={"text": f"never answered {i}"})
+                if rr.ok and jval(rr).get("msg_id"):
+                    nag_ids.append(jval(rr)["msg_id"])
+            nag_cli.disconnect()
+            time.sleep(1.0)
+            nag2_cli, nag2_box = sconn(nag_id)
+            time.sleep(0.8)
+            n3 = (nag2_box["unread"] or [None])[-1]
+            check("nudge: every unanswered task is counted, and the list is capped at 10",
+                  n3 is not None and len(nag_ids) == 11
+                  and (n3.get("unread") or {}).get("tasks", 0) >= 11
+                  and len(n3.get("task_ids") or []) == 10 and n3.get("tasks_truncated") is True,
+                  one_line(json.dumps(n3), 160))
+            if (n3 or {}).get("task_ids"):
+                r = requests.get(f"{s}/result/{n3['task_ids'][0]}", timeout=T, headers=auth)
+                row = jval(r) if r.ok else {}
+                check("nudge: a listed task really is one that never got a result frame",
+                      row.get("state") == "delivered" or row.get("status") == "delivered",
+                      one_line(json.dumps(row), 140))
+            else:
+                check("nudge: a listed task really is one that never got a result frame",
+                      False, "no task_ids in the notice")
+            nag2_cli.disconnect()
+            time.sleep(1.0)
+            nag3_cli, nag3_box = sconn(nag_id)
+            time.sleep(0.8)
+            # The cap means one of the eleven was still owed to it, so a second notice is correct -
+            # what must never happen is a *repeat*. Everything the two sockets were told has to be
+            # a subset of the eleven, named once each.
+            once = [m for b in (nag2_box, nag3_box) for n in b["unread"]
+                    for m in (n.get("task_ids") or [])]
+            check("nudge: no task handle is ever named twice (the never-twice rule)",
+                  len(once) == len(set(once)) and set(once) <= set(nag_ids),
+                  f"{len(once)} mentions, {len(set(once))} distinct, "
+                  f"strangers {sorted(set(once) - set(nag_ids))[:2]}")
+            nag3_cli.disconnect()
+
+            # The 10-handle cap has to *defer*, not forget. Twelve files owed to one id is a name
+            # list of 10 plus two that must still be owed afterwards - and the notice that names them
+            # also has to flush a relay, because an earlier version cleared the whole pending set
+            # whenever a queue drained, which lost those two announcements for good while telling
+            # nobody. So the relay is queued on purpose, in the same notice.
+            cap_id = f"st-cap-{suffix}"
+            cap_fids = []
+            for i in range(12):
+                rr = requests.post(f"{s}/file", timeout=T,
+                                   headers={**auth, "X-Target-Agent": cap_id},
+                                   files={"file": (f"owed{i}.json",
+                                                   json.dumps({"i": i, "s": suffix}).encode())})
+                if rr.status_code in (200, 201) and jval(rr).get("file_id"):
+                    cap_fids.append(jval(rr)["file_id"])
+            requests.post(f"{s}/relay", timeout=T, headers=auth,
+                          json={"to": cap_id, "text": "flush me with the twelve"})
+            cap_cli, cap_box = sconn(cap_id)
+            time.sleep(0.8)
+            cn = (cap_box["unread"] or [None])[-1]
+            named = [f.get("file_id") for f in (cn or {}).get("files") or []]
+            check("nudge: 12 owed files are counted as 12 and named 10 at a time",
+                  len(cap_fids) == 12 and (cn or {}).get("files") and cn["files_truncated"] is True
+                  and len(named) == 10 and (cn.get("unread") or {}).get("files") == 12
+                  and cn.get("relays_flushed") == 1,
+                  one_line(json.dumps(cn), 150))
+            cap_cli.disconnect()
+            time.sleep(1.0)
+            cap2_cli, cap2_box = sconn(cap_id)
+            time.sleep(0.8)
+            cn2 = (cap2_box["unread"] or [None])[-1]
+            named2 = [f.get("file_id") for f in (cn2 or {}).get("files") or []]
+            check("nudge: the surplus past the cap is still owed later, never dropped",
+                  cn2 is not None and set(named2) == set(cap_fids) - set(named)
+                  and cn2.get("files_truncated") in (False, None),
+                  f"owed {len(cap_fids)}, first notice {len(named)}, second {named2}")
+            cap2_cli.disconnect()
+
+            health_decl = next((e for e in manifest.get("endpoints", [])
+                                if e.get("path") == "/health"), {})
+            hd = jval(requests.get(f"{s}/health", timeout=T))
+            unread_h = hd.get("unread") or {}
+            check("nudge: /health reports the cadence, and 0 means the periodic sweep is off",
+                  "unread" in (health_decl.get("returns") or {}).get("keys", [])
+                  and unread_h.get("every_seconds", -1) >= 0
+                  and unread_h.get("enabled") is bool(unread_h.get("every_seconds"))
+                  and unread_h.get("list_max") == 10 and unread_h.get("mail_queue_max") == 200,
+                  one_line(json.dumps(unread_h), 160))
+            if args.logtoken:
+                r = requests.get(f"{s}/logs/{args.logtoken}", timeout=T + 15)
+                check("nudge: its two new badges are styled (an undeclared one renders invisible)",
+                      ".b-UNREAD_NUDGE" in r.text and ".b-MSG_QUEUED" in r.text,
+                      f"{r.status_code}, css absent" if ".b-UNREAD_NUDGE" not in r.text else "")
 
     # ---- optional live round-trip
     if args.agent:

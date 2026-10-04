@@ -1,8 +1,9 @@
 flask>=3.0
-flask-socketio>=5.3.6
+flask-socketio>=5.6.1       # <5.6.1 restores the socket session with `ctx.session = …`, which newer
+                            # Flask made read-only: /agents handshakes die, every HTTP route is fine
 python-socketio>=5.11
 python-engineio>=4.9
-simple-websocket>=1.0
-websocket-client>=1.7
+simple-websocket>=1.0      # hub side: answers the Upgrade, else agents fall back to polling
+websocket-client>=1.7      # agent side: engineio/client.py imports it as `websocket`, dynamically
 requests>=2.31
 ngrok>=1.7

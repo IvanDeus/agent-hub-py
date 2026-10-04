@@ -167,7 +167,7 @@ def emit(r: "requests.Response") -> bool:
 class Agent:
     def __init__(self, server: str, agent_id: str, token: str, quiet: bool = False,
                  force: bool = False, no_credential_file: bool = False,
-                 on_task=None, on_peer_msg=None, on_file_ready=None,
+                 on_task=None, on_peer_msg=None, on_file_ready=None, on_unread=None,
                  auto_reply: bool = False, exec_cmd: str = ""):
         self.server, self.agent_id, self.token = server, agent_id, token
         self.force = force
@@ -176,6 +176,7 @@ class Agent:
         self.on_task = on_task
         self.on_peer_msg = on_peer_msg
         self.on_file_ready = on_file_ready
+        self.on_unread = on_unread
         self.auto_reply = auto_reply
         self.exec_cmd = exec_cmd
         self.state = STATE_ROOT / agent_id
@@ -190,7 +191,7 @@ class Agent:
         self.deliberate_stop = False
         self.last_refusal = ""
         self.agent_token = ""      # per-agent credential minted by the hub at connect (v1.5)
-        for ev in ("task", "peer_msg", "file_ready", "superseded", "reactivated"):
+        for ev in ("task", "peer_msg", "file_ready", "unread", "superseded", "reactivated"):
             self.sio.on(ev, self._make_handler(ev), namespace="/agents")
         # The hub hands out a credential bound to this agent_id at connect. Every HTTP call this
         # process makes presents it, so `from` is derived from which credential authenticated
@@ -386,6 +387,32 @@ class Agent:
                         self.on_file_ready(file_info, self)
                     except Exception as exc:
                         self._log(f"[{now()}] on_file_ready error: {exc}")
+            elif ev == "unread":
+                # Report only, deliberately. file_ready's pull runs synchronously inside the
+                # packet loop (~30 s), so auto-fetching every missed file would be N x 30 s of
+                # stalled pings. The handles are written to the inbox; what you do with them is
+                # your call - and the queued relays this notice mentions have already arrived
+                # as ordinary peer_msg frames.
+                u = data.get("unread") or {}
+                files = data.get("files") or []
+                self._write_inbox({"type": "unread", "reason": data.get("reason"),
+                                   "at": data.get("at"), "unread": u,
+                                   "task_ids": data.get("task_ids"), "files": files,
+                                   "relays_flushed": data.get("relays_flushed"),
+                                   "text": f"{u.get('tasks', 0)} task(s), "
+                                           f"{u.get('files', 0)} file(s), "
+                                           f"{u.get('relays', 0)} relay(s) you never received"})
+                self._log(f"[{now()}] UNREAD [{data.get('reason')}]: "
+                          f"{u.get('tasks', 0)} unanswered task(s) -> GET /result/<msg_id>; "
+                          f"named {len(files)} of {u.get('files', 0)} file(s) -> "
+                          f"GET /file/<file_id> with X-Agent-Token; "
+                          f"{data.get('relays_flushed', 0)} queued relay(s) released to me as "
+                          f"peer_msg")
+                if self.on_unread:
+                    try:
+                        self.on_unread(data, self)
+                    except Exception as exc:
+                        self._log(f"[{now()}] on_unread error: {exc}")
             elif ev in ("superseded", "reactivated"):
                 mine = self.sio.get_sid(namespace="/agents")
                 if ev == "superseded":

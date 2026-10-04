@@ -14,6 +14,16 @@ serves on `localhost` only.
 
 - **NAT bypass** — agents hold one persistent outbound Socket.IO connection; the hub
   pushes tasks/files down it (server → agent never needs an inbound port).
+- **Unread nudge + relay queue** (v1.9) — a push needs a live socket, so the hub now remembers
+  what it could not push and tells a rejoining agent: an `unread` event at connect, on
+  reactivation and every `HUB_UNREAD_NUDGE_SECONDS` (45) lists the tasks nobody answered
+  (`msg_id` handles → `GET /result/<msg_id>`), the stored files no socket was ever told about
+  (full handles, `GET /file/<file_id>` with the credential the same handshake pushed) and how
+  many held relays it is releasing as ordinary `peer_msg`. Nothing is announced twice — one
+  abandoned task is reported once, not every 45 s. A relay to an offline agent is now
+  `{"status":"queued"}` (memory, drop-oldest at 200 per agent) instead of a 404 that destroyed
+  the text; `GET /agents` shows `mail_backlog` and `/health.unread` shows the whole backlog.
+  `0` stops the periodic sweep but keeps the connect notice, so a queue can never strand.
 - **Routing** — `POST /agent/<agent_id>/message` delivers to exactly that agent and
   returns its reply, with a bounded wait so requests **never hang** on a dead agent
   (offline ⇒ instant `404`, slow ⇒ `delivered_no_ack`).
@@ -63,7 +73,7 @@ serves on `localhost` only.
   token), colored
   badges: `CONNECTED` `DISCONNECTED` `MSG_SENT` `MSG_RCVD` `AUTH_FAIL` `ID_REJECTED`
   `CRED_MINTED` `CRED_FAIL` `SCOPE_DENY` `TASK_EXPIRED` `TASK_WEDGED` `HOUSEKEEP` `FILE_SENT`
-  `FILE_RCVD` `MSG_FAIL`.
+  `FILE_RCVD` `MSG_FAIL` `UNREAD_NUDGE` `MSG_QUEUED`.
   Rows carrying more than the 160-char summary show a `▾` — click to expand the full
   payload (newlines preserved, capped at 4000 chars). A header **auto-refresh button**
   (on by default, remembered per tab) ticks the page every 5 s — click it off for
@@ -75,6 +85,71 @@ serves on `localhost` only.
 
 ## Changelog
 
+- **v1.9.1** — the Flask-SocketIO floor moves **5.3.6 → 5.6.1**, and no `app.py` logic changed.
+  Restoring a socket's session, Flask-SocketIO through 5.6.0 writes `ctx.session = session_obj`;
+  newer Flask turned that name into a read-only property over `_session` (5.6.1 is the first release
+  that checks `hasattr(ctx, '_session')` and picks the right one), so the write raises
+  `AttributeError: property 'session' of 'RequestContext' object has no setter` inside
+  `_handle_event` and **every `/agents` handshake aborts** — while `GET /health`, `/llms.txt`,
+  uploads and the log page all keep answering 200. That asymmetry is the whole reason this shipped
+  as a floor rather than a note: the hub looks healthy from the operator's seat and broken only from
+  the agent's. Three venvs, three measured verdicts on the same build: 5.6.0 + Flask 3.1.3 →
+  **68 passed then `ERROR ConnectionError`** at the first socket connect; 5.6.1 + Flask 3.1.3 →
+  **124 passed, 0 failed**; 5.3.6 + *upstream* Flask 3.0.2 → also **124 passed**, which is why the
+  Requirements section now says not to trust a version string — this box's own
+  `python3-flask 3.0.2-1ubuntu1.1` already carries the property, so the identical number is safe on
+  PyPI and broken here. `mock_agent.py` and `client.py` are agent-side (no Flask), so they never
+  touched this path; the scratch venv the v1.9 verification ran in is no longer a workaround, it is
+  just the floor written down.
+- **v1.9.0** — the hub tells an agent what it missed (`unread_nudge`, `relay_queue`). The
+  reconnect-cycle checks proved the hole: hub→agent delivery is push-only, so a two-minute tunnel
+  blip was a two-minute black hole — `POST /agent/<id>/message` answered an instant 404, a
+  `POST /file` with `X-Target-Agent` stored the bytes, logged `MSG_FAIL` and queued **nothing**,
+  and `POST /relay` to an offline id 404'd and **destroyed the text**. An agent that rejoined had
+  no way to know any of it had happened. Now every agent is told at connect, on reactivation and
+  every `HUB_UNREAD_NUDGE_SECONDS` (45, floor 15) in one `unread` event: `tasks` (ledger rows
+  still `delivered` — no `result` frame ever came back), `files` (bytes stored while the id had no
+  socket, announced with `file_id`/`url`/`sha256` so the credential the same handshake pushed can
+  `GET /file/<id>`), `relays`. Three sources, three deliberately different treatments: **tasks are
+  reported, not queued** (a task has a `TASK_TTL_SECONDS` deadline and a caller blocked on `wait=`,
+  and `row["task"]` only keeps 200 chars — replaying it 20 minutes late is worse than the honest
+  404, so the notice hands back `msg_id`s to read with `GET /result/<msg_id>` and points past-deadline
+  rows at `/tasks/dead-letter`); **files are announced** (the bytes were always durable, only the
+  notice was ever lost); **relays are held** — new `agent_mail` queue, 200 per id drop-oldest,
+  200 ids before the coldest is evicted, released 20 at a time as ordinary `peer_msg` (so
+  `mock_agent.py` needs no new decode path). Being told *once* is the part that decides the shape:
+  a file leaves `files_unannounced` when announced and a relay leaves its queue when flushed, but a
+  `delivered` row stays `delivered` however long nobody answers it, so tasks need their own
+  never-twice ledger (`nudged_tasks`, cap 2000, evicted like `id_rejects`) — otherwise one abandoned
+  task nags its agent every 45 s forever. Counted rows and named rows are two different numbers on
+  purpose: `unread.tasks` is the honest total, `task_ids`/`files` name at most 10 each and set
+  `*_truncated`. `HUB_UNREAD_NUDGE_SECONDS=0` stops the sweep but keeps the connect notice, because
+  a queue nothing ever drains is a leak. Both new badges (`UNREAD_NUDGE`, `MSG_QUEUED`) are declared
+  in `LOG_CSS` — `.badge` sets `color:#fff` with no default background, so an undeclared tag renders
+  invisible white-on-white. The queues and markers age out in `retention_sweep` alongside inboxes
+  (report keys `queued_relays`, `retired_relay_queues`), because dead ids that keep accumulating
+  bookkeeping is the bug `EVENT_INDEX` already documents. `mock_agent.py` *reports only*: writing the
+  notice to `inbox.jsonl` and printing the three counts — `file_ready`'s inline pull is synchronous
+  in the packet loop (~30 s), so auto-fetching N missed files would be N × 30 s of stalled pings.
+  Cost: `/llms.txt` went **19,988 B → 22,626 B** (22,602 characters, which is the unit the guard
+  compares), the `unread` declaration alone rendering 1,074 B (bigger than `agent_token`'s 498 B)
+  plus a 15th footgun, so the selftest size guard moved **20,000 → 23,000** instead of cutting
+  documentation — deliberately only **398 chars of headroom**, so the next declared surface gets
+  paid for on purpose rather than absorbed. That unit is easy to lose: the guard prints
+  `len(response.text)`, which is characters, and both the v1.8.1 note's `19,988 B … 12 B of
+  headroom` and the check's own label read them as bytes until this run recomputed them (that
+  render was 19,965 chars). The prose was still
+  tightened to drop the payload-key list `unread` duplicated from `/health.unread`. Suite
+  **124 passed, 0 failed** (+17: the missed file announced at connect with a matching `sha256` and
+  really downloadable with the credential the same handshake pushed, a held relay arriving as
+  `peer_msg` with its original `from`, an announced file never announced twice, 11 unanswered tasks
+  counted with the list capped at 10 and no handle named twice across three sockets, `/agents`
+  `mail_backlog`, `/health` cadence + caps, both badge classes present). Writing that last batch
+  caught a real bug in the same edit: the notice drain cleared `files_unannounced` whenever a relay
+  queue emptied, so an agent owed more files than the cap named 10 and **lost the rest forever** —
+  confirmed by putting the line back (the 12-file check fails with `second []`) and re-running green
+  after removing it. Re-run green with `HUB_UNREAD_NUDGE_SECONDS=0` (124 passed, 0 failed): the
+  connect notice is deliberately not the sweep's off-switch, so `0` still cannot strand a queue.
 - **v1.8.1** — the handshake hands over the client (`connect_client_hint`). `GET /client.py`
   already existed but nothing told a connecting agent about it, so a bare socket had to find the
   docs to get a reference implementation. The `agent_token` event gained an additive `client` key:
@@ -289,8 +364,16 @@ serves on `localhost` only.
 python3 -m pip install -r requirements.txt   # Flask, Flask-SocketIO, python-socketio, requests, ngrok
 ```
 
-Tested with Python 3.13 / Flask 3.1 / Flask-SocketIO 5.3 (threading async mode —
-no monkey-patching needed). The `ngrok` package is optional: if it is missing, or
+Tested with Python 3.12 / Flask 3.1.3 / Flask-SocketIO 5.6.1 (threading async mode —
+no monkey-patching needed). The floor is not a preference: Flask moved
+`RequestContext.session` behind a read-only property over `_session`, and every
+Flask-SocketIO through 5.6.0 still writes `ctx.session = …` while restoring a socket's
+session, so the handshake aborts mid-connect with `AttributeError: property 'session' of
+'RequestContext' object has no setter` while **every HTTP route keeps answering 200** —
+which is how a broken dependency reads as a misbehaving agent. Do not check your version
+string to decide: upstream Flask 3.0.2 is fine (Flask-SocketIO 5.3.6 passes the full suite
+there), but this box's `python3-flask 3.0.2-1ubuntu1.1` already carries the read-only
+property. Install the floor. The `ngrok` package is optional: if it is missing, or
 `NGROK_AUTHTOKEN` is unset, the hub skips the tunnel and still runs locally.
 
 ## Environment variables
@@ -311,6 +394,7 @@ no monkey-patching needed). The `ngrok` package is optional: if it is missing, o
 | `HUB_RETENTION_DAYS` | Age at which the hub prunes its own state: stored files, ledger, dead-letter, log rows, queued messages | default `14`; `0` = never age out (count caps still apply) |
 | `HUB_RETENTION_SWEEP_SECONDS` | How often the sweep runs after startup | default `3600`, floored at `60` |
 | `HUB_RETENTION_DRY_RUN` | `1` makes every sweep report-only — nothing is deleted | optional — off by default |
+| `HUB_UNREAD_NUDGE_SECONDS` | How often a connected agent is told what it never received: unanswered tasks, files no socket was announced, held relays. Also fires once at connect and once on `reactivated` | default `45`, floored at `15`; `0` = no periodic sweep (the connect notice still fires, so a relay queue cannot strand) |
 | `HUB_LOG_WRITE_INTERVAL` | Seconds between rewrites of the on-disk log *mirror*. The rings are the read path, so this only bounds how stale `logs.html` gets — never what an agent sees | default `2`; `0` = legacy write-per-event (still rendered off `log_lock`) |
 | `HUB_ACKED_TTL_SECONDS` | With `>0`, a task row whose only results are ACKs is dead-lettered once as `acked_silence` after this much silence and flagged `wedged`. The ledger row is **kept**, so a late answer still lands | default `0` = off (report `awaiting_answer` only, change no lifetimes) |
 | `AGENT_CREDENTIAL_FILE` | Client-side (`mock_agent.py`): `0` never writes the minted credential to `state/<id>/credential.txt` | default `1` (`--no-credential-file` is the per-run switch) |
@@ -514,10 +598,10 @@ Always add `ngrok-skip-browser-warning: true` when traffic crosses ngrok free ti
 | Method & path | Description |
 |---|---|
 | `GET /` | Onboarding page (no auth; also the 401 body for browsers) |
-| `GET /health` | Liveness + `version` + `features` + `public_url`, plus additive blocks: `retention{days, enabled, …}`, `memory{rss_kb, measured_ceiling_kb, caps, dominates, note}` (measured on a disposable at every cap — a ceiling, not a limit) and `log_mirror{writes, rows_written, interval_seconds, dirty}` (no auth) |
+| `GET /health` | Liveness + `version` + `features` + `public_url`, plus additive blocks: `retention{days, enabled, …}`, `unread{every_seconds, enabled, next_nudge_in, queued_relays, queued_for_agents, files_unannounced, notices_total, list_max, mail_queue_max, note}` (v1.9 — `enabled` is the periodic sweep only; the connect notice always fires), `memory{rss_kb, measured_ceiling_kb, caps, dominates, note}` (measured on a disposable at every cap — a ceiling, not a limit) and `log_mirror{writes, rows_written, interval_seconds, dirty}` (no auth) |
 | `GET /llms.txt` | Markdown API guide for agents (no auth) |
 | `GET /api` | JSON manifest: endpoints, socket contract, footguns, auth model (no auth) |
-| `GET /agents` | Connected agents — `{agents:{id:sid}}` (stable shape) plus `count`, `agent_ids`, `detail{id:{sid, connected_at, last_seen, last_superseded_at, standby_sockets, inbox_backlog, outstanding_tasks}}`, `standby{id:{sid:since}}` and a `task_ledger{outstanding_by_agent, awaiting_answer_by_agent, stranded, dead_letter, ttl_seconds, acked_ttl_seconds, expiry_note, endpoint}` summary (`stranded` = tasks waiting on an id that no longer has a socket; `awaiting_answer_by_agent` = rows whose only results are ACKs — the hub can now tell a task finished in one result from one an agent ACKed and wedged on; read `last_seen` next to `outstanding_tasks` for the wedged-agent signature) |
+| `GET /agents` | Connected agents — `{agents:{id:sid}}` (stable shape) plus `count`, `agent_ids`, `detail{id:{sid, connected_at, last_seen, last_superseded_at, standby_sockets, inbox_backlog, mail_backlog, outstanding_tasks}}`, `standby{id:{sid:since}}` and a `task_ledger{outstanding_by_agent, awaiting_answer_by_agent, stranded, dead_letter, ttl_seconds, acked_ttl_seconds, expiry_note, endpoint}` summary (`stranded` = tasks waiting on an id that no longer has a socket; `awaiting_answer_by_agent` = rows whose only results are ACKs — the hub can now tell a task finished in one result from one an agent ACKed and wedged on; `mail_backlog` = relays held for that id which it has not been told about yet, v1.9; read `last_seen` next to `outstanding_tasks` for the wedged-agent signature) |
 | `GET /agent-id/<id>` | Pre-flight the v1.4 uniqueness rule: `{agent_id, available, taken_by_sid, connected_at, standby_sockets, last_rejection}` — free/never-seen ids return `200 available:true`, malformed ⇒ `400` with the pattern |
 | `POST /agent/<id>/message` | Body `{"text": …}` → routed to agent, returns its **first** reply. Offline ⇒ `404` with start-one hint. `?wait=<0-60>` budget (`?wait=0` returns as soon as it is emitted). Every call also answers `task_state` + `result_endpoint` + `expires_at`, because the ledger row is opened at emit time. Caveat: mock_agent auto-ACKs, so `status:"replied"` usually means *received* — poll `GET /result/<msg_id>` or the inbox for the rest |
 | `GET /result/<msg_id>` | The **ledger row** for one task (last 500 msg_ids, this process only) — `{msg_id, agent, from, task, delivered_at, deadline_at, results[], count, state:"delivered"\|"acked"\|"answered"\|"expired", status:"first_result"\|"done"\|"answered_via_inbox", answered_via_inbox, late, hub_issued, seconds_until_expiry, answered_by, updated, note}`. A `404` now means *this hub never issued that msg_id* (or it restarted) — never "nobody answered it"; an unanswered task keeps its row and goes `expired`. Agent credential reads only rows it owns (targeted at it, answered by it, or **posted by it** — since
@@ -525,8 +609,8 @@ v1.5.1 the caller of `POST /agent/<id>/message` can poll the `result_endpoint` i
 advertised) |
 | `GET /tasks/dead-letter` | Triage: every delivered task that produced nothing — `{count, tasks[], newest_last, states, ledger_rows, scoped_to, outstanding_by_agent, expired_total, ttl_seconds, note}`, each row with `reason:"expired"\|"acked_silence"\|"evicted"` + `died` and `awaiting_answer`. `?limit=1-200`. An agent credential sees only its own dead rows (`scoped_to` names the filter); the operator token sees the mesh. A growing `outstanding_by_agent` next to a connected agent is the wedged-agent signature |
 | `GET /agent/<id>/inbox` | Unsolicited agent→client messages. **Drains and clears by default** — add `?peek=true` to inspect non-destructively. Returns `drained`, `queue_max`, `agent_online`; entries carry `msg_id` when the sender tagged one. An agent credential may only touch **its own** inbox ⇒ `403` otherwise |
-| `POST /relay` | Body `{"to": "<agent_id>", "text": …}` → hub pushes `peer_msg` to that agent |
-| `POST /file` | `multipart file=@…` or raw body + `X-Filename` (a raw `application/json` body with no `X-Filename` is stored as `body.json`). Optional `X-Target-Agent` pushes a notify **and** records that agent in `shared_with` — since v1.5 being addressed is what grants it the download. Wrong id ⇒ 201 with `target_error`, never silent. Allowed ext: `.json .txt .html .tar.gz .tgz` ≤ 25 MB, ASCII names. 201 returns `sha256`, `delivered`, `duplicate_of` (advisory). **`?dedupe=1`** ⇒ identical bytes already stored returns `200 {status:"existing", file_id:<old>, deduped:true, bytes_stored:false}` instead of a new id |
+| `POST /relay` | Body `{"to": "<agent_id>", "text": …}` → hub pushes `peer_msg` to that agent. Since v1.9 an offline target **keeps the text**: `200 {"status":"queued", "msg_id", "queue_depth"}` (memory, 200 per id drop-oldest) instead of the `404` that used to destroy it, released as ordinary `peer_msg` when that agent rejoins or on its next `unread` notice |
+| `POST /file` | `multipart file=@…` or raw body + `X-Filename` (a raw `application/json` body with no `X-Filename` is stored as `body.json`). Optional `X-Target-Agent` pushes a notify **and** records that agent in `shared_with` — since v1.5 being addressed is what grants it the download. Wrong id ⇒ 201 with `target_error`, never silent; an id with **no live socket** keeps the bytes *and* the debt (v1.9) — `target_error` says so and the agent's next `unread` notice names the `file_id`. Allowed ext: `.json .txt .html .tar.gz .tgz` ≤ 25 MB, ASCII names. 201 returns `sha256`, `delivered`, `duplicate_of` (advisory). **`?dedupe=1`** ⇒ identical bytes already stored returns `200 {status:"existing", file_id:<old>, deduped:true, bytes_stored:false}` instead of a new id |
 | `GET /files` | File metadata table + `count` (persists across restarts via `file_store/index.json`; objects left by pre-v1.1 hubs are auto-adopted from disk at startup). **`?ids=<file_id,…>`** (≤500) answers just those rows and **`?limit=<N>`** the N newest — one row used to cost the whole 138 KB table (v1.8). Either param adds `total_matching`/`trimmed`/`trim_note`; **no params keeps the legacy shape**. An agent credential sees only files it uploaded or that named it in `X-Target-Agent` (`scoped_to`), and `ids=`/`limit=` cannot widen that |
 | `GET /file/<file_id>` | Download a stored file (as attachment) — `403` for an agent that neither uploaded it nor was addressed by `X-Target-Agent` |
 | `DELETE /file/<file_id>` | (v1.6) Reclaim an object: bytes + index entry gone, `freed_bytes` reported. **Uploader agent or operator only** — a file shared *to* you is not yours to destroy (`403` names the uploader). Deleted ids `404` forever; `sha_index` re-points at the newest surviving duplicate so `dedupe=1` never hands out a dead id |
@@ -549,12 +633,17 @@ Socket.IO namespace `/agents`, agent-side events: receives **`agent_token`** (v1
 `{agent_id, token, note}`, sent to your socket right after `connect`; use `token` as
 `X-Agent-Token` on HTTP instead of the shared operator token; since v1.8.1 the same payload
 carries `client.fetch` — a ready `curl -fsS $HUB/client.py` already holding that credential, so a
-newly connected agent can pull the reference client without the master token), `task`, `peer_msg`,
-`file_ready`, `superseded` (sent to the old socket when another process registers the same
+newly connected agent can pull the reference client without the master token), `task`, `peer_msg`
+(a relay released from the queue carries `msg_id` + `queued_at`, v1.9),
+`file_ready`, **`unread`** (v1.9 — the recovery notice: `{agent_id, reason:"connect"|"reactivated"|"tick", unread:{tasks, files, relays}, task_ids[], tasks_truncated, files[], files_truncated, relays_flushed, note}`;
+handles for what was aimed at it while it had no socket, announced once and never twice, and the
+held relays arrive right after it as ordinary `peer_msg`), `superseded` (sent to the old socket when another process registers the same
 `agent_id`) and `reactivated` (sent to that standby when the winner disconnects — its routing
-comes back with a **fresh credential**, no restart needed); sends `result` (replies),
+comes back with a **fresh credential** and the notice of everything it missed while it stood by,
+no restart needed); sends `result` (replies),
 `agent_to_client` (optional `msg_id` tag ⇒ `GET /result/<msg_id>` reports `answered_via_inbox`),
-`agent_to_agent`. Exact payloads: `GET /api` → `socket`. **`connect` auth is
+`agent_to_agent` (since v1.9 an offline target answers `{status:"queued", msg_id, queue_depth}`
+instead of `{error:"offline"}` — the text is held, not dropped). Exact payloads: `GET /api` → `socket`. **`connect` auth is
 `{"token": …, "agent_id": …}`** and, since v1.4, an id that is already live is refused with a
 reason naming the holder unless you also send `"force_takeover": true` (or `?force=1` on the query
 string). Two-phase replies: the first `result` satisfies the HTTP call; **every** result is kept
@@ -576,9 +665,23 @@ the operator appends one JSON action per line to `state/<agent_id>/outbox.jsonl`
 ```
 
 Everything the agent receives is appended to `state/<agent_id>/inbox.jsonl`
-(tasks, peer messages, downloaded files with `sha_ok` verdicts, action acks); pushed
-files are auto-downloaded to `state/<agent_id>/downloads/`. State root = `$HUB_STATE_DIR`
-or `./state` next to the script.
+(tasks, peer messages, downloaded files with `sha_ok` verdicts, action acks, and since v1.9 the
+`unread` notices); pushed files are auto-downloaded to `state/<agent_id>/downloads/`. State root =
+`$HUB_STATE_DIR` or `./state` next to the script.
+
+Since v1.9 it also catches **`unread`** and *reports only* — one console line naming the three
+counts and the routes that read them back, plus the row in `inbox.jsonl`:
+
+```
+UNREAD [connect]: 1 unanswered task(s) -> GET /result/<msg_id>; named 1 of 1 file(s) ->
+GET /file/<file_id> with X-Agent-Token; 1 queued relay(s) released to me as peer_msg
+```
+
+Auto-downloading every missed file was deliberately *not* done: `file_ready`'s pull is synchronous
+inside the packet loop (~30 s), so N missed files would be N × 30 s of stalled pings — the reference
+client hands you the handles and lets you decide. (Registering the event is not optional either:
+python-socketio silently discards an event with no handler, so an unhandled `unread` would make the
+feature look broken from the client side.)
 
 Since v1.5 it also **catches the `agent_token` event and prefers it over the shared token** on
 every HTTP call (`X-Agent-Token`), printing
@@ -611,9 +714,11 @@ identity on HTTP comes from the `agent_token` credential your socket was handed,
 client, and `GET /events/mine?limit=50` shows what the hub did with you without the operator's log
 secret. When a task you were given goes quiet, that is now a *stated* fact rather than a missing
 key: `GET /result/<msg_id>` reports `state:"expired"` and `GET /tasks/dead-letter` lists it.
-Run `python3 selftest.py --server $HUB --token $AGENT_AUTH_TOKEN [--agent <live-id>]` to verify a
-hub implements the v1.5 contract end-to-end (exit 0 = healthy; safe to run against any hub,
-read-only except its own selftest uploads).
+Run `python3 selftest.py --server $HUB --token $AGENT_AUTH_TOKEN [--agent <live-id>] [--socket]`
+to verify a hub implements the contract end-to-end (exit 0 = healthy; safe to run against any hub,
+read-only except its own selftest uploads). `--socket` adds the live-socket sections: the v1.4
+duplicate-id refusal, the reconnect cycle (drop → blind window → rejoin on a freshly minted
+credential) and the v1.9 unread nudge — it needs `python-socketio` on the box running the test.
 
 ## Multi-agent test (verified end-to-end)
 
@@ -661,6 +766,7 @@ contract (61 checks) against any hub you suspect is behind.
 | Two agents fight over one id | Refused since v1.4: the second socket never connects (see next row). Give each process its own `agent_id` — suffix the pid, `scout-2`, or a role name. On a pre-v1.4 hub the newest socket won routing by design; the loser got `superseded`, stayed listed under `/agents` `standby`, and received `reactivated` if the winner died (v1.3) |
 | `CONNECT FAILED (hub refused)` / `ID_REJECTED` in the log | Someone already holds that `agent_id`. `mock_agent.py` prints the verdict (`GET /agent-id/<id>`: holder sid + `connected_at`); pick a free id, or add `--force-takeover` when displacing it is the point |
 | Retrying an upload keeps growing the store | Push `POST /file?dedupe=1`: identical bytes ⇒ `200 {status:"existing", file_id:<old>}`, nothing written |
+| An agent rejoined and you are not sure it got what was aimed at it | Since v1.9 you do not have to guess: the hub pushes it an `unread` notice at connect and every `HUB_UNREAD_NUDGE_SECONDS`, and `GET /health` `.unread` reports `queued_relays` / `files_unannounced` / `notices_total` for the whole mesh (`GET /agents` `.detail[id].mail_backlog` per agent). A `POST /relay` to an offline id is `200 {status:"queued"}` and its text survives; a task POST to an offline id is still `404` on purpose — a task has a deadline, so a late replay is worse than an honest refusal (see `GET /tasks/dead-letter`) |
 | Agent wants the event log but has no `LOG_SECRET_TOKEN` | `GET /events/mine` — its own rows only, token + `X-Agent-Id` |
 | Log page 404 | Use the exact `LOG_SECRET_TOKEN` value: `/logs/$LOG_SECRET_TOKEN` |
 
