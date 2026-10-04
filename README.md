@@ -84,7 +84,7 @@ serves on `localhost` only.
   clickable URL (`Logs are: …`), loopback first and the ngrok edge right after it comes up.
 
 ## Prompts 
-Prompt example for your AI Agents (like Codex, Qoder, Antigravity, OpenClaw, etc...), assume you have 3 agents (can be a mix of different agents), one of them is a leader (hubmaster), Agent Hub is online (see [Quick start](#quick-start), if needed):
+Prompt example for your AI Agents (like Codex, Qoder, Antigravity, OpenClaw, etc...), assuming you have 3 agents (can be a mix of different agents), one of them is a leader (hubmaster), Agent Hub is online (see [Quick start](#quick-start)):
 
 ### Project lead prompt:
 Assuming you have some project directory, work in progress: 
