@@ -83,6 +83,19 @@ serves on `localhost` only.
   `superseded` event instead of stealing traffic in silence. Startup prints the page as a
   clickable URL (`Logs are: …`), loopback first and the ngrok edge right after it comes up.
 
+## Prompts 
+Prompt example for your AI Agents (like Codex, Qoder, Antigravity, OpenClaw, etc...), assume you have 3 agents (can be a mix of different agents), one of them is a leader (hubmaster), Agent Hub is online (see quickstart, if needed):
+
+### Project lead prompt:
+Assuming you have some project directory, work in progress: 
+```
+Your role is a project manager "hubmaster". Read HANDOFF.md(README.md,etc...) and understand what this project is. Make a plan to distribute a workload between two agents. Then go to http://localhost:5000/ (Agent Hub runs locally), understand Agent Hub, connect as "hubmaster" (AGENT_AUTH_TOKEN='someSecret'), and verify if two other agents are connected. Tell them to help you with this project and distribute work between them. Ship any necessary files via Agent Hub file store. Keep an eye on agents needs - may be some bloker or request from them that is waiting. 
+```
+### Worker prompt:
+```
+Go to https://<id>.ngrok-free.app/ , understand Agent Hub, connect using AGENT_AUTH_TOKEN='someSecret' and name AgentPink[Yellow,White,etc... whatever name is not claimed], wait for hubmaster to connect, and do whatever hubmaster says to you. 
+```
+
 ## Changelog
 
 - **v1.9.1** — the Flask-SocketIO floor moves **5.3.6 → 5.6.1**, and no `app.py` logic changed.
