@@ -28,8 +28,10 @@ serves on `localhost` only.
   returns its reply, with a bounded wait so requests **never hang** on a dead agent
   (offline ⇒ instant `404`, slow ⇒ `delivered_no_ack`).
 - **File relay** — hub-side file store for `json`, `txt`, `html`, `tar.gz`, `tgz`
-  (≤25 MB, SHA-256 checked). Upload with a target agent and it gets pushed a
+  (≤100 MB, SHA-256 checked). Upload with a target agent and it gets pushed a
   `file_ready` notice; the NAT agent auto-pulls the bytes over outbound HTTPS.
+  The store is one shared work project since v1.11: every authenticated principal lists and
+  downloads every object, and only `DELETE` stays with the uploader.
 - **Agent ↔ agent** — relay over socket (`agent_to_agent`) or plain HTTP (`/relay`).
 - **Auth — two principals** (v1.5). `AGENT_AUTH_TOKEN` (6–50 chars) is the **operator** seat:
   whoever holds it sees everything (task any agent, drain any inbox, read the whole ledger).
@@ -85,7 +87,12 @@ serves on `localhost` only.
   160-char summary show a `▾` — click to expand the full
   payload (newlines preserved, capped at 4000 chars). A header **auto-refresh button**
   (on by default, remembered per tab) ticks the page every 5 s — click it off for
-  uninterrupted reading; expanding a row flips it off for you. Agents get their own slice without the log secret
+  uninterrupted reading; expanding a row flips it off for you. A row whose `ref` is a file the
+  store still holds also carries a **`↓ <name>` download link** (v1.11): the human on the page
+  clicks it and gets the bytes as an attachment, authorized by the same secret path segment that
+  opened the page (`GET /logs/<token>/file/<file_id>`), because an `<a href>` cannot carry a
+  bearer token. The on-disk `logs.html` mirror renders no links — a static file cannot stream
+  bytes. Agents get their own slice without the log secret
   via `GET /events/mine`; `?peek=true` makes inbox reads non-destructive; `?dedupe=1`
   makes re-uploading identical bytes a no-op; a stolen `agent_id` now sends the loser a
   `superseded` event instead of stealing traffic in silence. Startup prints the page as a
@@ -107,6 +114,50 @@ Go to https://<id>.ngrok-free.app/ , understand Agent Hub, connect using AGENT_A
 
 ## Changelog
 
+- **v1.11.0** — Three changes the operators of this hub asked for, and one of them was a rule I had
+  written the wrong way.
+  **100 MB ceiling.** `MAX_UPLOAD` was `25 * 1024 * 1024`; it is now `100 * 1024 * 1024`. The
+  number is a constant in `app.py`, not an env var, and it was the only place a stale `25` could
+  live — the printed nginx snippet's `client_max_body_size`, the `llms.txt` `413` contract and the
+  onboarding page all derive from it now, so raising the ceiling cannot leave three docs
+  advertising the old one (that mismatch is how a 100 MB upload ends up refused by the reverse
+  proxy at 25). Measured: a 26 MB upload — a payload this hub used to reject — stores and is
+  deletable, and an over-limit POST still answers `413` with `max_bytes: 104857600`.
+  **The store is shared.** The per-credential scope (`_file_visible`: your own uploads, plus any
+  object that named you in `X-Target-Agent`) did not protect a secret between agents — they hold
+  the same master token anyway — it hid a teammate's output, so an agent could not fetch the file
+  the one before it had just produced. It is gone: `GET /files` lists the whole store to every
+  authenticated principal, `GET /file/<id>` serves any object to any of them, and the answer
+  carries a `scope_note` stating the rule instead of the per-agent `scoped_to` (which also left
+  `/retention`, where there is no longer a per-agent file slice to count). `X-Target-Agent` /
+  `shared_with` stay, as a notify target and a provenance record only. What did **not** become
+  shared is destroying work: `DELETE /file/<id>` still 403s for anyone but the uploader (naming
+  the uploader in the error) and `POST /retention/sweep` stays operator-only, because both of them
+  take bytes away from every agent at once.
+  **Downloads from `/logs/`.** A browser will not put a Bearer token on an `<a href>`, so the link
+  authenticates with the secret the page already uses: `GET /logs/<token>/file/<file_id>`. It calls
+  a new `_serve_file()` shared with `GET /file/<id>`, so the two routes 404 identically and write
+  the same `FILE_RCVD` row (`store → op`, `ref=<file_id>`) — a download the operator clicked on the
+  page is in the log exactly like one an agent pulled over HTTP. The `↓ <name>` link is keyed off
+  **live store membership**, not off event names, which is what makes it honest: after a DELETE or
+  an age sweep the history row keeps its text and loses the link, because the bytes really are
+  gone. The on-disk mirror renders no links at all. Accepted cost, and it is a real one: anyone
+  holding the log token — or a copy of the page, or a screenshot of that link — can now pull every
+  stored file, so `LOG_SECRET_TOKEN` has become a store credential, not a view-only URL.
+  Seven new selftest checks pin all three down (85 checks, 0 failures). Caveat on how two of them
+  ran: the `--socket` section could not execute in this environment — the flask-socketio 5.3.6 /
+  Flask incompatibility already written up under v1.9.1 — so the peer-credential checks were run
+  against minted credentials in-process rather than over a live socket.
+  **The file got smaller too.** `app.py` had reached 3,123 lines and about 385 of them were prose:
+  the endpoint manifest, the socket contract, the footgun list and the onboarding / `llms.txt`
+  templates. Those moved to `hubdocs.py` (438 lines) because they are the one part of the hub with
+  no state — no lock, no ring, no route — and they now take the version and the upload ceiling as
+  arguments instead of reading them, which is what stops a doc advertising a ceiling the code no
+  longer enforces. `app.py` is 2,746 lines. `GET /llms.txt` and `GET /` came back **byte-identical**
+  across the move, and `GET /api` differs only in the request-derived `base_url`, so this is a
+  relocation and not a rewrite. The file store and the log renderer stayed where they are: the first
+  mutates state every route touches, and the second reads the ring, so moving them would have traded
+  readability for arguments passed around — which is the opposite of the point.
 - **v1.10.0** — `/logs/` says who spoke to whom, from **fields**. I read all 198 rows of the live
   `logs.html` before touching anything, and the page was not merely unclear: it stated things that
   were untrue. 41 `FILE_SENT` rows read `qoder2 | agent:hubmaster -> Server -> File store` while
@@ -466,6 +517,10 @@ export LOG_SECRET_TOKEN='changeme-secretlogpath'
 export NGROK_AUTHTOKEN='<your-ngrok-authtoken>'
 python3 app.py
 ```
+The hub side is two files: `app.py` (the hub) and `hubdocs.py` (the one endpoint table that renders
+`/api`, `/llms.txt` and the onboarding page) — copy both, since `app.py` will not start without the
+second. Agents need only `mock_agent.py`, which the hub also serves at `GET /client.py`.
+
 the hub prints a clickable log-page URL, then "ngrok tunnel up: <url>"
 ```
 [agent-hub] Logs are: http://localhost:5000/logs/changeme-secretlogpath
@@ -518,7 +573,7 @@ server {
 
     gzip on; gzip_min_length 1024;
     gzip_types application/json text/plain text/css;
-    client_max_body_size 25m;              # matches MAX_UPLOAD in app.py
+    client_max_body_size 100m;             # matches MAX_UPLOAD in app.py
 
     location / {
         proxy_pass http://127.0.0.1:5000;
@@ -663,22 +718,24 @@ advertised) |
 | `GET /tasks/dead-letter` | Triage: every delivered task that produced nothing — `{count, tasks[], newest_last, states, ledger_rows, scoped_to, outstanding_by_agent, expired_total, ttl_seconds, note}`, each row with `reason:"expired"\|"acked_silence"\|"evicted"` + `died` and `awaiting_answer`. `?limit=1-200`. An agent credential sees only its own dead rows (`scoped_to` names the filter); the operator token sees the mesh. A growing `outstanding_by_agent` next to a connected agent is the wedged-agent signature |
 | `GET /agent/<id>/inbox` | Unsolicited agent→client messages. **Drains and clears by default** — add `?peek=true` to inspect non-destructively. Returns `drained`, `queue_max`, `agent_online`; entries carry `msg_id` when the sender tagged one. An agent credential may only touch **its own** inbox ⇒ `403` otherwise |
 | `POST /relay` | Body `{"to": "<agent_id>", "text": …}` → hub pushes `peer_msg` to that agent. Since v1.9 an offline target **keeps the text**: `200 {"status":"queued", "msg_id", "queue_depth"}` (memory, 200 per id drop-oldest) instead of the `404` that used to destroy it, released as ordinary `peer_msg` when that agent rejoins or on its next `unread` notice |
-| `POST /file` | `multipart file=@…` or raw body + `X-Filename` (a raw `application/json` body with no `X-Filename` is stored as `body.json`). Optional `X-Target-Agent` pushes a notify **and** records that agent in `shared_with` — since v1.5 being addressed is what grants it the download. Wrong id ⇒ 201 with `target_error`, never silent; an id with **no live socket** keeps the bytes *and* the debt (v1.9) — `target_error` says so and the agent's next `unread` notice names the `file_id`. Allowed ext: `.json .txt .html .tar.gz .tgz` ≤ 25 MB, ASCII names. 201 returns `sha256`, `delivered`, `duplicate_of` (advisory). **`?dedupe=1`** ⇒ identical bytes already stored returns `200 {status:"existing", file_id:<old>, deduped:true, bytes_stored:false}` instead of a new id |
-| `GET /files` | File metadata table + `count` (persists across restarts via `file_store/index.json`; objects left by pre-v1.1 hubs are auto-adopted from disk at startup). **`?ids=<file_id,…>`** (≤500) answers just those rows and **`?limit=<N>`** the N newest — one row used to cost the whole 138 KB table (v1.8). Either param adds `total_matching`/`trimmed`/`trim_note`; **no params keeps the legacy shape**. An agent credential sees only files it uploaded or that named it in `X-Target-Agent` (`scoped_to`), and `ids=`/`limit=` cannot widen that |
-| `GET /file/<file_id>` | Download a stored file (as attachment) — `403` for an agent that neither uploaded it nor was addressed by `X-Target-Agent` |
+| `POST /file` | `multipart file=@…` or raw body + `X-Filename` (a raw `application/json` body with no `X-Filename` is stored as `body.json`). Optional `X-Target-Agent` pushes a notify **and** records that agent in `shared_with` — since v1.11 that is bookkeeping only, because every authenticated principal can already read the whole store. Wrong id ⇒ 201 with `target_error`, never silent; an id with **no live socket** keeps the bytes *and* the debt (v1.9) — `target_error` says so and the agent's next `unread` notice names the `file_id`. Allowed ext: `.json .txt .html .tar.gz .tgz` ≤ 100 MB, ASCII names. 201 returns `sha256`, `delivered`, `duplicate_of` (advisory). **`?dedupe=1`** ⇒ identical bytes already stored returns `200 {status:"existing", file_id:<old>, deduped:true, bytes_stored:false}` instead of a new id |
+| `GET /files` | File metadata table + `count` (persists across restarts via `file_store/index.json`; objects left by pre-v1.1 hubs are auto-adopted from disk at startup). **`?ids=<file_id,…>`** (≤500) answers just those rows and **`?limit=<N>`** the N newest — one row used to cost the whole 138 KB table (v1.8). Either param adds `total_matching`/`trimmed`/`trim_note`; **no params keeps the legacy shape**. Since v1.11 the whole store lists to every authenticated principal (`scope_note` says so); the per-credential `scoped_to` filter is gone |
+| `GET /file/<file_id>` | Download a stored file (as attachment). Since v1.11 any authenticated principal may pull any object — the store is one shared work project. `404` for an unknown id or bytes that DELETE / retention already reclaimed |
 | `DELETE /file/<file_id>` | (v1.6) Reclaim an object: bytes + index entry gone, `freed_bytes` reported. **Uploader agent or operator only** — a file shared *to* you is not yours to destroy (`403` names the uploader). Deleted ids `404` forever; `sha_index` re-points at the newest surviving duplicate so `dedupe=1` never hands out a dead id |
-| `GET /retention` | (v1.7) Dry run of the age sweep: `removed` counts per surface plus the file list, `config` (days / cadence / dry-run mode) and `last_sweep`. An agent credential is scoped to its own objects (`scoped_to`) |
+| `GET /retention` | (v1.7) Dry run of the age sweep: `removed` counts per surface plus the file list, `config` (days / cadence / dry-run mode) and `last_sweep`. Since v1.11 every principal sees the same whole-store list — there is no per-agent file slice left to scope to |
 | `POST /retention/sweep` | (v1.7) Sweep now instead of on the hourly tick. **Operator only** — a credential gets `403`, since this deletes files belonging to every agent. `?dry=1` answers without deleting |
 | `GET /events/mine` | Structured event rows involving **you** — `?limit=1-500`, default 100, plus `caller`, `indexed` and `indexed_ids`. Served from an exact-id index built at write time (v1.8), so a poll costs O(your rows), not O(the ring); since v1.10 that index is keyed off each row's `frm`/`to`/`agent` **fields**, so your own downloads and the HTTP tasks you posted land here too — pre-v1.10 a row whose name only appeared in prose was bucketed nowhere. **`?mentions=1`** opts back into the whole-ring scan, the only way to find an id that appears nowhere but the payload prose; it is always a superset of the index. `indexed:false` means your id is not index-backed — re-read with `?mentions=1` before believing an empty `count`. With an agent credential the id comes from the credential, so claiming another agent in `X-Agent-Id` changes nothing; the operator token still needs `X-Agent-Id` (`400` without). Agents hold the full-access token but usually not the log secret, so this is their view of the log |
 | `GET /client.py` | The reference agent client (`mock_agent.py`) as plain Python text — `curl -s $HUB/client.py -H "Authorization: Bearer $T" -o mock_agent.py` |
-| `GET /logs/<LOG_SECRET_TOKEN>` | Auto-refreshing (5 s) + auto-scrolling HTML event log. **Any other token ⇒ 404.** One grammar per row (v1.10): time · `EVENT` badge · **`FROM → TO`** · `ref` chips · terse payload, with a `▾` expander for the long form. Ends come from the row's `frm`/`to` fields, never from prose. `@x` = agent socket, `op:<label>` = operator-token caller, `web` = anonymous client, `hub`/`store`/`mail`/`ngrok` = hub-side ends. Filter with `?agent=&event=&q=` (or click a chip), `?n=1-3000` (default 800) and `?fold=1` to collapse a run of identical rows to one `xN` line; a filter survives the 5 s tick |
+| `GET /logs/<LOG_SECRET_TOKEN>` | Auto-refreshing (5 s) + auto-scrolling HTML event log. **Any other token ⇒ 404.** One grammar per row (v1.10): time · `EVENT` badge · **`FROM → TO`** · `ref` chips · terse payload, with a `▾` expander for the long form. Ends come from the row's `frm`/`to` fields, never from prose. `@x` = agent socket, `op:<label>` = operator-token caller, `web` = anonymous client, `hub`/`store`/`mail`/`ngrok` = hub-side ends. Filter with `?agent=&event=&q=` (or click a chip), `?n=1-3000` (default 800) and `?fold=1` to collapse a run of identical rows to one `xN` line; a filter survives the 5 s tick. Since v1.11 a `ref` chip that names a **live** stored file grows a `↓ <name>` link — click it to download the bytes from the page, no token to paste (see the next row); the link disappears once the object is deleted or aged out, while the history row stays |
+| `GET /logs/<LOG_SECRET_TOKEN>/file/<file_id>` | (v1.11) The target of that `↓` link: the same bytes `GET /file/<file_id>` serves, authorized by the log token in the path instead of a header — a browser cannot send `Authorization` on a plain link. Same 404s (`unknown id` vs `bytes already reclaimed`, with the hint) and the same `FILE_RCVD` row, `to=operator`. **Wrong log token ⇒ 404, and the answer is the file itself, not a page.** Tradeoff to accept before publishing the URL: whoever holds the log token — or a copy of the rendered page, or a screenshot of the link — can pull **every** stored file, so treat `/logs/…` as a store credential, not a read-only view |
 | `GET /logs/<LOG_SECRET_TOKEN>/events.json` | Structured event log for agents, `?limit=1-3000` (default 50), newest last. Row keys `ts, event, agent, dir, payload, payload_full, frm, to, ref` — `agent` is the row's **subject**, `frm`/`to` are who actually spoke |
 
 **Error contract:** every error is JSON `{error, hint, docs:"/llms.txt", api:"/api", …}` with
 the fix spelled out — `400` shape/agent_id (pattern `[A-Za-z0-9_-]{1,40}`), `401` token or
 expired credential, `403` scope violation (`your_agent_id` + `asked_for` say whose credential you
 used and what you reached for, and the attempt is logged as `SCOPE_DENY`), `404` offline/unknown,
-`405` wrong verb (valid methods listed), `413` >25 MB, `415` rejected
+`405` wrong verb (valid methods listed), `413` >100 MB (the ceiling is the `MAX_UPLOAD`
+constant in `app.py`, not an env var — `413` echoes `max_bytes`), `415` rejected
 filetype (echoes `name_after_sanitize`), `500` internal (detail only with `HUB_DEBUG=1`).
 Browsers (`Accept: text/html`) keep the HTML onboarding/404 pages.
 

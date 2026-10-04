@@ -199,11 +199,14 @@ def main() -> int:
     # v1.9 moved this ceiling 20,000 -> 23,000: the unread notice is a whole socket event and the
     # guard exists to catch runaway doc growth, not to keep the guide at an arbitrary size.
     # v1.10 moves it 23,000 -> 24,000 for the same reason: the log row grammar, its five query
-    # params, the four new events.json row keys and the `agent` vs `frm`/`to` footgun are +947
-    # chars over the v1.9.1 render (measured: 22,602 -> 23,549 chars, 22,626 -> 23,573 B).
+    # params, the events.json row keys and the `agent` vs `frm`/`to` footgun are +947 chars over
+    # the v1.9.1 render (measured: 22,602 -> 23,549 chars, 22,626 -> 23,573 B).
+    # v1.11 moves it 24,000 -> 25,000: /logs carries a download route, the store stops being
+    # scoped per agent and the ceiling is 100 MB, which is +928 chars over the v1.10 render
+    # (measured: 23,549 -> 24,477 characters).
     # `len(r.text)` counts CHARACTERS, not bytes - labelling it "bytes" below is how a README
     # claim once came out 24 B off its own arithmetic.
-    check("llms.txt sane size", 0 < len(llms) < 24000, f"{len(llms)} chars")
+    check("llms.txt sane size", 0 < len(llms) < 25000, f"{len(llms)} chars")
     drift = [e["path"] for e in manifest.get("endpoints", []) if e["path"] not in llms]
     check("docs drift: every /api path appears in /llms.txt", not drift, str(drift))
 
@@ -289,6 +292,40 @@ def main() -> int:
     check("files list: count + created_iso",
           r.ok and {"files", "count"} <= set(fl)
           and "created_iso" in fl.get("files", {}).get(fid, {}), r.text[:120])
+
+    # ---- v1.11: the ceiling is behavior, not a doc string. A 26 MB upload used to cost a 413;
+    #      the body is zeros so the hub writes 26 MB of near-nothing to its own store, and this
+    #      test hands it straight back with DELETE.
+    big = bytes(26 * 1024 * 1024)
+    r = requests.post(f"{s}/file", timeout=T + 120, headers=auth,
+                      files={"file": ("st-big-26mb.json", big)})
+    big_j = jval(r) if r.status_code in (200, 201) else {}
+    check("v1.11 26 MB upload stores (the old 25 MB ceiling is gone)",
+          r.status_code == 201 and big_j.get("size") == len(big),
+          f"{r.status_code} {one_line(r.text, 100)}")
+    if big_j.get("file_id"):
+        requests.delete(f"{s}/file/{big_j['file_id']}", timeout=T, headers=auth)
+
+    # ---- v1.11: the log page hands a file to the human reading it. An <a href> cannot carry an
+    #      Authorization header, so the link uses the same secret path segment that opens the
+    #      page, and a row whose bytes have left the store gets no link at all.
+    if args.logtoken:
+        href = f"/logs/{args.logtoken}/file/{fid}"
+        page = requests.get(f"{s}/logs/{args.logtoken}", timeout=T + 15)
+        check("v1.11 /logs links a file row to its bytes while the store still holds them",
+              page.ok and href in page.text,
+              f"{page.status_code}, link "
+              + ("there" if href in page.text else "ABSENT"))
+        dl = requests.get(f"{s}{href}", timeout=T + 15)
+        check("v1.11 that link streams the bytes as an attachment with no token header",
+              dl.ok and dl.content == payload and name in dl.headers.get("content-disposition", ""),
+              f"{dl.status_code}, {len(dl.content)} B")
+        wrong = requests.get(f"{s}/logs/{args.logtoken}x/file/{fid}", timeout=T)
+        check("v1.11 a wrong log token on a file link 404s like the page itself does",
+              wrong.status_code == 404, f"{wrong.status_code}")
+        gone = requests.get(f"{s}/logs/{args.logtoken}/file/deadbeef00000000", timeout=T)
+        check("v1.11 a file link for an id the store does not have 404s with a hint",
+              gone.status_code == 404 and "hint" in jval(gone), f"{gone.status_code}")
 
     # ---- v1.5.2: DELETE /file/<id> exists, is scoped, and actually reclaims
     r = requests.delete(f"{s}/file/deadbeef00000000", timeout=T, headers=auth)
@@ -665,6 +702,21 @@ def main() -> int:
                                     headers={**hdr, "X-Agent-Token": two_box["cred"]})
                 check("peer agent gets 403 deleting another agent's upload",
                     bool(fid_own) and r.status_code == 403, r.text[:120])
+                # ---- v1.11: the store is shared to READ. Two live credentials, so this is the
+                #      whole contract in one shot: peer pulls the bytes, peer lists the object,
+                #      peer still cannot destroy it (the 403 above is the point of the split).
+                r = requests.get(f"{s}/file/{fid_own}", timeout=T,
+                                 headers={**hdr, "X-Agent-Token": two_box["cred"]})
+                check("v1.11 a peer agent DOWNLOADS another agent's upload (shared store)",
+                      bool(fid_own) and r.status_code == 200 and r.content == own_bytes,
+                      f"{r.status_code} {len(r.content)} B")
+                r = requests.get(f"{s}/files", timeout=T,
+                                 headers={**hdr, "X-Agent-Token": two_box["cred"]})
+                fj = jval(r) if r.ok else {}
+                check("v1.11 a peer agent LISTs another agent's upload, and says the store is "
+                      "shared rather than claiming a scope",
+                      r.ok and fid_own in (fj.get("files") or {}) and "scoped_to" not in fj
+                      and "scope_note" in fj, one_line(str(fj)[:150]))
                 r = requests.delete(f"{s}/file/{fid_own}", timeout=T,
                                     headers={**hdr, "X-Agent-Token": one_box["cred"]})
                 check("uploader agent deletes its own file (200)",
