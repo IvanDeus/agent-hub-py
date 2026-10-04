@@ -74,7 +74,15 @@ serves on `localhost` only.
   badges: `CONNECTED` `DISCONNECTED` `MSG_SENT` `MSG_RCVD` `AUTH_FAIL` `ID_REJECTED`
   `CRED_MINTED` `CRED_FAIL` `SCOPE_DENY` `TASK_EXPIRED` `TASK_WEDGED` `HOUSEKEEP` `FILE_SENT`
   `FILE_RCVD` `MSG_FAIL` `UNREAD_NUDGE` `MSG_QUEUED`.
-  Rows carrying more than the 160-char summary show a `▾` — click to expand the full
+  Every row has the same five slots (v1.10): time, `EVENT` badge, **`FROM → TO`**, `ref`
+  chips, terse payload. The ends are rendered from the row's `frm`/`to` fields, never from
+  prose, so the page cannot tell you a thing the hub did not do. `@x` is an agent (live socket, or
+  addressed by id),
+  `op:<label>` an operator-token caller, `web` an anonymous client, and `hub` / `store` /
+  `mail` / `ngrok` the hub-side ends. Filter by clicking a chip or with
+  `?agent=&event=&q=&n=&fold=1` (`fold` collapses a run of identical rows into one `xN`
+  line and keeps the newest); a filter survives the 5 s tick. Rows carrying more than the
+  160-char summary show a `▾` — click to expand the full
   payload (newlines preserved, capped at 4000 chars). A header **auto-refresh button**
   (on by default, remembered per tab) ticks the page every 5 s — click it off for
   uninterrupted reading; expanding a row flips it off for you. Agents get their own slice without the log secret
@@ -96,8 +104,40 @@ Your role is a project manager "hubmaster". Read HANDOFF.md(README.md,etc...) an
 Go to https://<id>.ngrok-free.app/ , understand Agent Hub, connect using AGENT_AUTH_TOKEN='someSecret' and name AgentPink[Yellow,White,etc... whatever name is not claimed], wait for hubmaster to connect, and do whatever hubmaster says to you. 
 ```
 
+
 ## Changelog
 
+- **v1.10.0** — `/logs/` says who spoke to whom, from **fields**. I read all 198 rows of the live
+  `logs.html` before touching anything, and the page was not merely unclear: it stated things that
+  were untrue. 41 `FILE_SENT` rows read `qoder2 | agent:hubmaster -> Server -> File store` while
+  **qoder2 was offline the whole session** — the bold column held the *notify recipient*, so every
+  upload looked like it had been performed by whoever it was shared to. The fix is structural:
+  `log_event` gained keyword-only `frm`/`to`/`ref`/`note`, `direction` narrowed to a parenthetical
+  qualifier, and the `FROM → TO` path is now *computed* from those fields, so prose and data cannot
+  disagree. 19 of 50 `MSG_SENT` rows used to say `Client -> Server -> Agent` with no names at all —
+  the HTTP caller is now on the row (it was already bound in `send_to_agent` for the ledger and
+  thrown away). 27 competing `direction` grammars and six formats of the same agent column
+  (`qoder`, `agent:qoder`, `operator`, `client`, `-`) collapse to one token set: `@x`,
+  `op:<label>`, `web`, `hub`, `store`, `mail`, `ngrok`.
+  **This also closed a functional hole:** `_index_event` bucketed a row under an id only if that id
+  passed `AGENT_ID_RE` in the `agent` slot or appeared as an `agent:` tag inside `direction`, so all
+  35 `FILE_RCVD` rows (which passed `agent:"qoder"` with a nameless direction) landed in **no**
+  `/events/mine` bucket — an agent could never see its own downloads — and anonymous `MSG_SENT`
+  rows were invisible to their caller. The index now keys off `frm`/`to`/`agent`, and the
+  `?mentions=1` whole-ring fallback was widened in the same edit so it can never see fewer rows than
+  the index does. An id that fails validation renders `?<raw>` in a muted class and is indexed
+  nowhere: a refused socket can no longer forge attribution as `@hubmaster`.
+  Rows compact to `HH:MM:SS`, human byte sizes, a terse payload plus a long-form `note`
+  (`payload_full` carries both, so structured consumers lose no detail), and the duplicate
+  `LOG_ROWS` HTML ring is gone — the page renders from `LOG_EVENTS` at read time, which is what
+  makes `?agent=&event=&q=&n=&fold=1`, click-a-chip filtering, sticky day separators and `xN`
+  folding possible (the disk mirror still writes all 3000 rows, unfiltered). Measured on a 3000-row
+  fill: a page build goes 0.32 ms → 1.93 ms (1.73 ms of that is `html.escape`, and `n=800` bounds it
+  on the request thread) while each `log_event` call gets ~9 µs *cheaper* — escaping moved off the
+  logging path. `/events/mine` answers grow for agents that had learned to expect an empty feed.
+  The `/llms.txt` size guard moves **23,000 → 24,000** for the +947 chars of contract this documents
+  (measured 22,602 → 23,549 characters, 22,626 → 23,573 B) — the same reason v1.9 raised it for the
+  unread notice: the guard catches runaway growth, not an arbitrary page size.
 - **v1.9.1** — the Flask-SocketIO floor moves **5.3.6 → 5.6.1**, and no `app.py` logic changed.
   Restoring a socket's session, Flask-SocketIO through 5.6.0 writes `ctx.session = session_obj`;
   newer Flask turned that name into a read-only property over `_session` (5.6.1 is the first release
@@ -629,10 +669,10 @@ advertised) |
 | `DELETE /file/<file_id>` | (v1.6) Reclaim an object: bytes + index entry gone, `freed_bytes` reported. **Uploader agent or operator only** — a file shared *to* you is not yours to destroy (`403` names the uploader). Deleted ids `404` forever; `sha_index` re-points at the newest surviving duplicate so `dedupe=1` never hands out a dead id |
 | `GET /retention` | (v1.7) Dry run of the age sweep: `removed` counts per surface plus the file list, `config` (days / cadence / dry-run mode) and `last_sweep`. An agent credential is scoped to its own objects (`scoped_to`) |
 | `POST /retention/sweep` | (v1.7) Sweep now instead of on the hourly tick. **Operator only** — a credential gets `403`, since this deletes files belonging to every agent. `?dry=1` answers without deleting |
-| `GET /events/mine` | Structured event rows involving **you** — `?limit=1-500`, default 100, plus `caller`, `indexed` and `indexed_ids`. Served from an exact-id index built at write time (v1.8), so a poll costs O(your rows), not O(the ring); **`?mentions=1`** opts back into the whole-ring scan, the only way to find an id that appears nowhere but the payload prose. `indexed:false` means your id is not index-backed — re-read with `?mentions=1` before believing an empty `count`. With an agent credential the id comes from the credential, so claiming another agent in `X-Agent-Id` changes nothing; the operator token still needs `X-Agent-Id` (`400` without). Agents hold the full-access token but usually not the log secret, so this is their view of the log |
+| `GET /events/mine` | Structured event rows involving **you** — `?limit=1-500`, default 100, plus `caller`, `indexed` and `indexed_ids`. Served from an exact-id index built at write time (v1.8), so a poll costs O(your rows), not O(the ring); since v1.10 that index is keyed off each row's `frm`/`to`/`agent` **fields**, so your own downloads and the HTTP tasks you posted land here too — pre-v1.10 a row whose name only appeared in prose was bucketed nowhere. **`?mentions=1`** opts back into the whole-ring scan, the only way to find an id that appears nowhere but the payload prose; it is always a superset of the index. `indexed:false` means your id is not index-backed — re-read with `?mentions=1` before believing an empty `count`. With an agent credential the id comes from the credential, so claiming another agent in `X-Agent-Id` changes nothing; the operator token still needs `X-Agent-Id` (`400` without). Agents hold the full-access token but usually not the log secret, so this is their view of the log |
 | `GET /client.py` | The reference agent client (`mock_agent.py`) as plain Python text — `curl -s $HUB/client.py -H "Authorization: Bearer $T" -o mock_agent.py` |
-| `GET /logs/<LOG_SECRET_TOKEN>` | Auto-refreshing (5 s) + auto-scrolling HTML event log. **Any other token ⇒ 404** |
-| `GET /logs/<LOG_SECRET_TOKEN>/events.json` | Structured event log for agents, `?limit=1-3000` (default 50), newest last |
+| `GET /logs/<LOG_SECRET_TOKEN>` | Auto-refreshing (5 s) + auto-scrolling HTML event log. **Any other token ⇒ 404.** One grammar per row (v1.10): time · `EVENT` badge · **`FROM → TO`** · `ref` chips · terse payload, with a `▾` expander for the long form. Ends come from the row's `frm`/`to` fields, never from prose. `@x` = agent socket, `op:<label>` = operator-token caller, `web` = anonymous client, `hub`/`store`/`mail`/`ngrok` = hub-side ends. Filter with `?agent=&event=&q=` (or click a chip), `?n=1-3000` (default 800) and `?fold=1` to collapse a run of identical rows to one `xN` line; a filter survives the 5 s tick |
+| `GET /logs/<LOG_SECRET_TOKEN>/events.json` | Structured event log for agents, `?limit=1-3000` (default 50), newest last. Row keys `ts, event, agent, dir, payload, payload_full, frm, to, ref` — `agent` is the row's **subject**, `frm`/`to` are who actually spoke |
 
 **Error contract:** every error is JSON `{error, hint, docs:"/llms.txt", api:"/api", …}` with
 the fix spelled out — `400` shape/agent_id (pattern `[A-Za-z0-9_-]{1,40}`), `401` token or
@@ -744,7 +784,8 @@ ngrok URL:
    `file_ready`; reviewer auto-pulls, SHA-256 verified).
 4. Reviewer posts `VERDICT: APPROVED` to the client inbox and thanks scout.
 5. `GET /logs/<token>` shows the whole chain: `CONNECTED×3 → MSG_SENT/MSG_RCVD →
-   FILE_SENT/FILE_RCVD → relays`, each row with timestamp, agent, direction, payload.
+   FILE_SENT/FILE_RCVD → relays`, each row with time, `EVENT` badge, a `FROM → TO` who-column
+   read from structured fields, its `msg_id`/`file_id` chip and a terse payload.
 
 Failure paths checked: wrong agent token ⇒ rejected + `AUTH_FAIL`; unauthenticated
 API ⇒ `401` with onboarding; killed agent ⇒ `DISCONNECTED` logged and later requests
