@@ -23,9 +23,10 @@ import secrets as pysecrets
 import sys
 import threading
 import time
-from collections import OrderedDict, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import Flask, Response, abort, jsonify, request, send_file
 from flask_socketio import ConnectionRefusedError, SocketIO
@@ -93,7 +94,7 @@ NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")  # optional: public tunn
 NGROK_DOMAIN = os.environ.get("NGROK_DOMAIN", "")        # optional: reserved ngrok domain (stable URL)
 HUB_DEBUG = os.environ.get("HUB_DEBUG", "") == "1"       # 500 responses include exception detail
 
-HUB_VERSION = "1.9.1"
+HUB_VERSION = "1.10.0"
 FEATURES = ["llms_txt", "api_manifest", "json_errors", "method_405", "inbox_peek",
             "agents_detail", "upload_sha256", "autojson_name", "file_index",
             "events_json", "ngrok_domain", "result_lookup", "events_mine",
@@ -105,7 +106,8 @@ FEATURES = ["llms_txt", "api_manifest", "json_errors", "method_405", "inbox_peek
             "events_payload_full", "atomic_index_write", "file_delete", "retention_sweep",
             "log_write_debounce", "result_ack_kind", "awaiting_answer_state",
             "events_mine_index", "events_mine_index_reclaim", "connect_client_hint",
-            "unread_nudge", "relay_queue"]
+            "unread_nudge", "relay_queue", "log_who_column", "events_from_to",
+            "log_filters"]
 STARTED_AT = time.time()
 
 ALLOWED_EXT = (".json", ".txt", ".html", ".htm", ".tar.gz", ".tgz")
@@ -169,18 +171,28 @@ TUNNEL_URL = ""            # set by open_tunnel() when the ngrok edge comes up
 
 # ----------------------------------------------------------------- logging
 LOG_MAX_ROWS = 3000
-LOG_ROWS = deque(maxlen=LOG_MAX_ROWS)      # pre-rendered HTML rows (human log page)
-LOG_EVENTS = deque(maxlen=LOG_MAX_ROWS)    # structured dicts (GET /logs/<token>/events.json)
+# ONE structured ring, rendered on read. It used to be two: LOG_ROWS held every event a second
+# time, pre-baked into HTML, so the page could be a string join. That duplicate ring carried up to
+# ~13 MB of the 52.5 MB a full log attributed to "the two rings", and it made the page
+# unfilterable - a row that is already markup cannot be folded, grouped, matched against a query or
+# re-columned without changing what a writer decided at event time. A 3000-row page build now costs
+# ~1.9 ms (0.32 ms joined, 1.73 ms of it html.escape) and each log call gets ~9 us CHEAPER,
+# because the escaping moved off the thread that logged and onto the reader that asked for it.
+LOG_EVENTS = deque(maxlen=LOG_MAX_ROWS)    # the log: one dict per event
+LOG_ROUTE_ROWS = 800                       # what one GET renders; the disk mirror keeps all 3000
 log_lock = threading.Lock()
 # GET /events/mine used to answer by regex-scanning EVERY row of a full ring while holding
 # log_lock - 3000 rows x (direction + 160-char summary) = 0.55 MB of matching per poll, measured
 # at a 14.9 ms lock hold (paired in-process, one ring). log_event and every other request queue
 # behind that: on a loaded disposable the poll cost 12 ms alone, 371 ms at 50-way, 546 ms with
-# traffic. The index below is built at write time from exactly the fields that regex read - the
-# row's own agent, plus agent:/Agent: tags in the direction string - keyed by EXACT id, so a poll
-# costs O(that agent's rows): 0.085 ms of lock for the same 375 rows. Prose mentions inside a
-# payload were never searched (only its summary) and still are not; ?mentions=1 keeps the old
-# whole-ring scan reachable.
+# traffic. The index below is built at write time from the row's own STRUCTURE - the agent it is
+# about, plus the `from` and `to` ends - keyed by EXACT id, so a poll costs O(that agent's rows):
+# 0.085 ms of lock for the same 375 rows. It used to read those ids out of `direction` prose
+# instead, which meant an agent was in its own feed only if the code path that logged its event
+# happened to spell "agent:" or "Agent:" in the sentence it authored: every FILE_RCVD row in a
+# 198-row session (agent column "agent:qoder", direction a nameless literal) landed in no bucket at
+# all, so that agent could never see its own downloads. Prose mentions inside a payload were never
+# searched and still are not; ?mentions=1 keeps the whole-ring scan reachable.
 LOG_SEQ = 0                        # rows ever appended - lets a bucket drop what the ring evicted
 EVENT_INDEX: dict = {}             # agent_id -> deque[(seq, row dict)], oldest first
 # An id in this index but not in the ring is dead weight; an id in the ring but not in this index
@@ -191,9 +203,88 @@ EVENT_INDEX: dict = {}             # agent_id -> deque[(seq, row dict)], oldest 
 # near-empty deques, ~2.4 MB, against 52.5 MB for the rings themselves.
 EVENT_INDEX_MAX_IDS = LOG_MAX_ROWS
 _EVENT_TAG_RE = re.compile(r"(?:agent|Agent):([A-Za-z0-9_\-]{1,40})(?![A-Za-z0-9_\-])")
+
+# ------------------------------------------------------- who a log row is speaking about/to
+# The single place a principal becomes a token a human reads. Before this, each of the 34 log
+# sites authored its own sentence, and 198 rows of one session carried 27 different grammars for
+# the same fact ("agent:x", "Agent:x", "Mail:x", a bare "x", "Client -> Server -> Agent"). Two of
+# those grammars were actively false: FILE_SENT put the notify RECIPIENT in the bold agent column
+# where the uploader belonged (the row credited agent qoder2, offline all session, for hubmaster's
+# upload), and actor_label()'s "agent:qoder"/"operator" leaked straight into a column that
+# otherwise held bare ids - six spellings of one column.
+#
+# Words here name a hub-side END, not an agent. An agent that connects as literally "hub", "store",
+# "mail", "web" or "operator" reads its own rows as the hub talking to itself; those names are
+# reserved by this table.
+_PSEUDO_END = {"": "hub", "-": "hub", "server": "hub", "hub": "hub",
+               "file store": "store", "store": "store", "files": "store",
+               "mail": "mail", "ngrok": "ngrok", "ngrok edge": "ngrok",
+               "client": "web", "web": "web", "operator": "op"}
+# Not real agent ids: indexing one spends an EVENT_INDEX bucket on something that can never poll,
+# and would make GET /events/mine answer indexed=true for a caller that does not exist.
+_RESERVED = frozenset(_PSEUDO_END.values()) | {"agent"}
+
+
+def _tok(ident: str) -> tuple:
+    """Bare id -> ('@id', 'id'). An id that does not match AGENT_ID_RE came from somewhere that
+    never validated it (a REFUSED connect reports the agent_id the client asked for), so it must
+    not be able to wear a real token's clothing: an agent_id of "@hubmaster" would otherwise
+    render a rejection as something the master's agent did."""
+    ident = (ident or "").strip()
+    if ident == "?":                     # the sid_to_agent miss sentinel: unknown, not an attack
+        return "?", ""
+    if AGENT_ID_RE.fullmatch(ident):
+        return f"@{ident}", ident
+    return f"?{ident[:48]}", ""
+
+
+def _who(label) -> tuple:
+    """Resolve any principal label to (display token, real agent id or "").
+
+      'agent:qoder'      -> ('@qoder', 'qoder')      credential-proven agent
+      'operator:hubmaster' -> ('op:hubmaster', 'hubmaster')  master token + SELF-DECLARED label
+      'operator'         -> ('op', '')               master token, no label
+      'client'           -> ('web', '')              nothing presented
+      'qoder'            -> ('@qoder', 'qoder')      validated bare id
+      'Server'/'File store'/'Mail:qoder' -> hub-side end, id from the tail where there is one
+
+    'op:' stays visibly different from '@' because an operator calling itself 'hubmaster' over the
+    master token is a claim, not a credential - the footgun this repo already documents. And the
+    display token embeds the raw id verbatim (@qoder, never Q(qoder)): GET /events/mine promises a
+    caller its own id appears in agent+dir+payload, and a token that hid it would break that
+    contract from the presentation layer.
+    """
+    raw = str(label or "").strip()
+    low = raw.lower()
+    if low in _PSEUDO_END:
+        return _PSEUDO_END[low], ""
+    head, sep, tail = raw.partition(":")
+    if sep:
+        h = head.lower()
+        if h in ("agent", "mail", "store", "to", "from"):
+            return _tok(tail)
+        if h == "operator":
+            disp, real = _tok(tail)
+            return (f"op:{real}" if real else "op"), real
+    return _tok(raw)
+
+
+def _humansize(n) -> str:
+    """17897384 -> '17.1 MB'. Byte counts were the single widest thing on the page."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
 log_write_warned_at = 0.0          # throttle the WARN so a broken disk is not a print flood
 log_mirror_writes = 0              # successful mirror writes since start - /health reports it
-# The rings are the source of truth and /logs renders from them on read, so the file on disk is
+# The ring is the source of truth and /logs renders from it on read, so the file on disk is
 # only a mirror: flag it dirty and flush on a cadence instead of rewriting a 13 MB page per event.
 LOG_WRITE_INTERVAL_SECONDS = max(0, int(os.environ.get("HUB_LOG_WRITE_INTERVAL", "2")))
 log_page_dirty = False
@@ -201,18 +292,29 @@ log_writer_started = False
 log_written_rows = -1              # how many rows the on-disk mirror was built from
 
 LOG_CSS = """
-:root{--bg:#f5f5f3;--fg:#1c1c1e;--card:#ffffff;--line:#e3e3df;--muted:#6b6b6f}
-@media(prefers-color-scheme:dark){:root{--bg:#111214;--fg:#e7e7ea;--card:#1a1c1f;--line:#2a2d31;--muted:#8b8f96}}
+:root{--bg:#f5f5f3;--fg:#1c1c1e;--card:#ffffff;--line:#e3e3df;--muted:#6b6b6f;--acc:#1d4ed8}
+@media(prefers-color-scheme:dark){:root{--bg:#111214;--fg:#e7e7ea;--card:#1a1c1f;--line:#2a2d31;--muted:#8b8f96;--acc:#60a5fa}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace;font-size:13px}
-header{padding:14px 18px;background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:12px;flex-wrap:wrap;align-items:center;position:sticky;top:0}
+header{padding:10px 14px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.hrow{display:flex;gap:12px;flex-wrap:wrap;align-items:baseline}
 header h1{font-size:15px;margin:0}
 header .sub{color:var(--muted);font-size:12px}
-#log{padding:8px 14px}
-.row{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;padding:6px 8px;border-bottom:1px solid var(--line);border-radius:6px}
+.legend{color:var(--muted);font-size:11px;margin-top:4px}
+.legend b{color:var(--fg);font-weight:700}
+#flt{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px}
+#flt input,#flt select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 8px;font:inherit;font-size:12px}
+#flt button{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer}
+#flt button:hover,#flt input:focus{border-color:var(--muted)}
+nav.chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
+a.chip{text-decoration:none;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:1px 9px;font-size:11px;white-space:nowrap}
+a.chip:hover{border-color:var(--muted)}
+a.chip.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+#log{padding:6px 12px}
+.row{display:grid;grid-template-columns:auto auto minmax(190px,max-content) minmax(220px,1fr);gap:10px;align-items:baseline;padding:4px 8px;border-bottom:1px solid var(--line);border-radius:6px}
 .row:hover{background:var(--card)}
-.ts{color:var(--muted);white-space:nowrap}
-.badge{padding:1px 9px;border-radius:999px;font-size:11px;font-weight:700;color:#fff;letter-spacing:.4px}
+.ts{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.badge{padding:1px 9px;border-radius:999px;font-size:11px;font-weight:700;color:#fff;letter-spacing:.4px;white-space:nowrap;background:#4b5563}
 .b-CONNECTED{background:#15803d}.b-DISCONNECTED{background:#b91c1c}.b-MSG_SENT{background:#1d4ed8}
 .b-MSG_RCVD{background:#7c3aed}.b-AUTH_FAIL{background:#c2410c}.b-FILE_SENT{background:#0e7490}
 .b-FILE_RCVD{background:#0f766e}.b-FILE_DEL{background:#475569}.b-HOUSEKEEP{background:#3f3f46}.b-MSG_FAIL{background:#52525b}.b-SERVER{background:#334155}
@@ -220,14 +322,25 @@ header .sub{color:var(--muted);font-size:12px}
 .b-TASK_EXPIRED{background:#9f1239}.b-TASK_WEDGED{background:#be123c}.b-SCOPE_DENY{background:#7c2d12}
 .b-CRED_MINTED{background:#4338ca}.b-CRED_FAIL{background:#be123c}
 .b-UNREAD_NUDGE{background:#1e40af}.b-MSG_QUEUED{background:#0369a1}
-.aid{font-weight:700}.dir{color:var(--muted);font-size:12px}.pl{flex:1;min-width:220px;word-break:break-word;color:var(--fg)}
-#ar{margin-left:auto;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer}
+.w{white-space:nowrap;font-size:13px;overflow:hidden;text-overflow:ellipsis}
+.f{font-weight:700}.g{font-weight:700;color:var(--acc)}.a{color:var(--muted);font-weight:400;padding:0 3px}
+.s{display:inline-block;color:var(--muted);font-size:11px;border:1px solid var(--line);border-radius:999px;padding:0 7px;margin-left:6px}
+.m{display:inline-block;color:var(--muted);font-size:11px;border:1px solid var(--line);border-radius:999px;padding:0 7px;margin-left:6px;text-decoration:none}
+.m:hover{border-color:var(--muted);color:var(--fg)}
+.bad{color:#b91c1c;background:rgba(185,28,28,.14);border-radius:4px;padding:0 3px}
+.x{color:var(--muted);font-size:11px;border:1px solid var(--line);border-radius:999px;padding:0 6px}
+.day{color:var(--muted);font-size:11px;letter-spacing:.6px;text-transform:uppercase;padding:9px 8px 3px;border-bottom:1px solid var(--line)}
+.empty{color:var(--muted);padding:18px 10px;text-align:center}
+.aid{font-weight:700}.dir{color:var(--muted);font-size:12px}
+.pl{min-width:0;word-break:break-word;color:var(--fg)}
+#ar{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer;margin-left:auto}
 #ar:hover{border-color:var(--muted)}
 .row.exp{cursor:pointer}
 .row.exp .pl::after{content:" ▾";color:var(--muted);font-size:11px}
 .row.exp.open .pl::after{content:" ▴";color:var(--muted);font-size:11px}
-.full{display:none;flex:1 0 100%;white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin:6px 0 2px;font-size:12px}
+.full{display:none;grid-column:1/-1;white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin:6px 0 2px;font-size:12px}
 .row.open .full{display:block}
+@media(max-width:760px){.row{grid-template-columns:auto auto;grid-auto-rows:auto}.w{white-space:normal}}
 """
 
 
@@ -264,17 +377,141 @@ LOG_JS = """
 """
 
 
-def _render_log(snapshot=None) -> str:
-    rows = "".join(LOG_ROWS if snapshot is None else snapshot)
+def _row_matches(row, agent, event, q) -> bool:
+    """One row against the active filter. `agent` matches ANY of the three ids a row carries
+    (subject, sender, recipient) rather than only the bold column, because that column is the
+    subject and a caller asking for '@qoder' means every row that involves qoder."""
+    if agent and agent not in (_who(row.get("agent", ""))[1], _who(row.get("frm", ""))[1],
+                              _who(row.get("to", ""))[1]):
+        return False
+    if event and row.get("event") != event:
+        return False
+    if q:
+        hay = f"{row.get('ref', '')} {row.get('payload', '')} {row.get('agent', '')}".lower()
+        if q.lower() not in hay:
+            return False
+    return True
+
+
+def _fold_key(row):
+    """What makes two consecutive rows the same line said twice. The first 64 payload chars, not
+    all of it: a file-push burst differs only in the msg_id, and the point of folding is to stop
+    that filling the page."""
+    return (row.get("event"), row.get("frm"), row.get("to"), row.get("ref"),
+            (row.get("payload") or "")[:64])
+
+
+def _log_row_html(row, repeat=0) -> str:
+    esc = html_mod.escape
+    d_f, id_f = _who(row.get("frm", ""))
+    d_t, id_t = _who(row.get("to", ""))
+    if row.get("frm") or row.get("to"):
+        who = (f"<span class='f'>{esc(d_f)}</span>"
+               f"<span class='a'>&#8594;</span><span class='g'>{esc(d_t)}</span>")
+    else:
+        # a row whose ends were never named: show its own words rather than invent an arrow
+        who = f"<span class='dir'>{esc(row.get('dir') or '-')}</span>"
+    subj = ""
+    d_s, id_s = _who(row.get("agent", ""))
+    if id_s and id_s not in (id_f, id_t):
+        subj = f"<span class='s' title='who this row is about'>re: {esc(d_s)}</span>"
+    ref = row.get("ref") or ""
+    ref_html = f"<a class='m' href='?q={quote(ref, safe='')}' title='task / file id'>#{esc(ref[:16])}</a>" if ref else ""
+    text = row.get("payload") or ""
+    if ref and text.startswith(f"[{ref}]"):      # the id has a column now; do not print it twice
+        text = text[len(ref) + 3:].lstrip()
+    full = row.get("payload_full") or ""
+    expandable = full != (row.get("payload") or "")
+    x = f"<span class='x' title='repeated'>×{repeat}</span> " if repeat > 1 else ""
+    detail = f"<div class='full'>{esc(full[:4000])}</div>" if expandable else ""
+    ev = row.get("event") or "?"
+    return (f"<div class='row{' exp' if expandable else ''}'>"
+            f"<span class='ts'>{esc((row.get('ts') or '')[11:])}</span>"
+            f"<span class='badge b-{esc(ev)}'>{esc(ev)}</span>"
+            f"<span class='w'>{who}{subj}{ref_html}</span>"
+            f"<span class='pl'>{x}{esc(text)}</span>{detail}</div>")
+
+
+def _render_log(rows, filt=None) -> str:
+    """Build the page from the structured ring. `filt` is None for the on-disk mirror, which must
+    stay the complete archive; the route passes {agent, event, q, n, fold}."""
+    filt = filt or {}
+    agent, event, q = filt.get("agent", ""), filt.get("event", ""), filt.get("q", "")
+    limit, fold = filt.get("n", 0), bool(filt.get("fold"))
+    esc = html_mod.escape
+    shown = [r for r in rows if _row_matches(r, agent, event, q)]
+    if limit and len(shown) > limit:
+        shown = shown[-limit:]
+    # chips count the WHOLE snapshot, not the filtered view, so no chip is ever a link to nothing
+    agents, events = Counter(), Counter()
+    for r in rows:
+        events[r.get("event") or "?"] += 1
+        for aid in (_who(r.get("agent", ""))[1], _who(r.get("frm", ""))[1], _who(r.get("to", ""))[1]):
+            if aid:
+                agents[aid] += 1
+
+    def chips(items, param):
+        return "".join(f"<a class='chip{' on' if v == (event if param == 'event' else agent) else ''}'"
+                       f" href='?{param}={quote(v, safe='')}'>{esc(v)} <span class='x'>{n}</span></a>"
+                       for v, n in items)
+
+    out = []
+    prev_day = ""
+    i = 0
+    while i < len(shown):
+        row = shown[i]
+        j = i + 1
+        repeat = 1
+        if fold:
+            key = _fold_key(row)
+            while j < len(shown) and _fold_key(shown[j]) == key:
+                j += 1
+            repeat = j - i
+            row = shown[j - 1]   # keep the NEWEST of the run - the ring is chronological, and a
+                                 # reader (and the selftest) asks "did the hub do it yet", of the
+                                 # last one, never the first
+        day = (row.get("ts") or "")[:10]
+        if day != prev_day:
+            out.append(f"<div class='day'>{esc(day)}</div>")
+            prev_day = day
+        out.append(_log_row_html(row, repeat))
+        i = j
+    body = "".join(out) or f"<div class='empty'>no rows match this filter ({len(rows)} in the ring)" \
+                           f" &middot; <a href=''>clear</a></div>"
+    tz = datetime.now().astimezone().tzname() or "local"
+    active = any((agent, event, q))
+    scope = f" &middot; filtered to {esc(agent or event or q)}" if active else ""
     return ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<title>Agent Hub - Event Log</title>"
             f"<link rel='icon' href='{FAVICON_ROUTE}'>"
             f"<style>{LOG_CSS}</style></head><body>"
-            "<header><h1>Agent Hub - Event Log</h1>"
-            "<span class='sub'>auto-scroll &middot; append-only &middot; "
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</span>"
-            "<button id='ar' title='tick every 5s; click to stop for uninterrupted reading'>auto-refresh: on</button></header>"
-            f"<div id='log'>{rows}</div>"
+            "<header><div class='hrow'><h1>Agent Hub - Event Log</h1>"
+            f"<span class='sub'>{len(shown)} of {len(rows)} rows &middot; {len(agents)} agents"
+            f"{scope} &middot; {datetime.now().strftime('%H:%M:%S')} {esc(tz)}</span>"
+            "<button id='ar' title='tick every 5s; click to stop for uninterrupted reading'>auto-refresh: on</button></div>"
+            "<div class='legend'>who column reads <b>sender &#8594; receiver</b> from structured "
+            "fields, never from message text &middot; <b>@id</b> an agent (live socket, or addressed "
+            "by id) &middot; "
+            "<b>op:id</b> operator token naming itself (a claim, not a credential) &middot; "
+            "<b>web</b> unauthenticated caller &middot; <b>hub / store / mail</b> the hub itself "
+            f"&middot; <b>re:</b> who the row is about when that is neither end &middot; times in {esc(tz)}</div>"
+            f"<form id='flt' method='get'>"
+            f"<input name='agent' placeholder='agent id' value='{esc(agent)}'>"
+            f"<select name='event'><option value=''>any event</option>"
+            + "".join(f"<option value='{esc(e)}'{' selected' if e == event else ''}>{esc(e)} ({n})</option>"
+                      for e, n in events.most_common())
+            + f"</select>"
+            f"<input name='q' placeholder='msg_id / text' value='{esc(q)}'>"
+            + ("<input type='hidden' name='fold' value='1'>" if fold else "")
+            + "<button>apply</button>"
+            + ("<a class='chip' href=''>clear</a>" if active or fold or limit else "")
+            + "</form>"
+            "<nav class='chips'>" + chips(agents.most_common(12), "agent") + chips(events.most_common(10), "event")
+            + ("<a class='chip' href='?fold=1" + (f"&agent={quote(agent, safe='')}" if agent else "")
+               + (f"&event={quote(event, safe='')}" if event else "") + "'>fold repeats</a>" if not fold
+               else "<a class='chip on' href='?'>unfold</a>")
+            + "</nav></header>"
+            f"<div id='log'>{body}</div>"
             f"<script>{LOG_JS}</script></body></html>")
 
 
@@ -317,14 +554,18 @@ def _evict_coldest_locked() -> None:
     EVENT_INDEX.pop(coldest, None)
 
 
-def _index_event(agent_id: str, direction: str, row: dict, seq: int) -> None:
-    """Caller holds log_lock. One regex over the ~60-char direction string plus the row's own
-    agent id, instead of a scan over every row's payload on every poll: the work moves to the
-    write (once per event) from the read (once per agent per poll)."""
-    ids = set(_EVENT_TAG_RE.findall(direction))
-    if AGENT_ID_RE.fullmatch(agent_id or ""):
-        ids.add(agent_id)
+def _index_event(row: dict, seq: int) -> None:
+    """Caller holds log_lock. Read the ids out of the row's STRUCTURE, not out of a sentence: the
+    agent the row is about plus both ends of who-spoke-to-whom. The regex pass over `dir` stays as
+    a superset so a row cannot lose an index entry it had under the old scheme; the `_RESERVED`
+    guard is what keeps 'hub'/'store'/'mail'/'web' from eating buckets, and `indexed=false` in
+    GET /events/mine depends on it.
+    """
+    ids = {_who(row.get("agent", ""))[1], _who(row.get("frm", ""))[1], _who(row.get("to", ""))[1]}
+    ids.update(_EVENT_TAG_RE.findall(row.get("dir", "") or ""))
     for aid in ids:
+        if not aid or aid in _RESERVED or not AGENT_ID_RE.fullmatch(aid):
+            continue
         bucket = EVENT_INDEX.get(aid)
         if bucket is None:
             if len(EVENT_INDEX) >= EVENT_INDEX_MAX_IDS:
@@ -335,35 +576,59 @@ def _index_event(agent_id: str, direction: str, row: dict, seq: int) -> None:
         bucket.append((seq, row))
 
 
-def log_event(event: str, agent_id: str, direction: str, payload: str = "") -> None:
+def log_event(event: str, agent_id: str = "", direction: str = "", payload: str = "",
+              *, frm: str = "", to: str = "", ref: str = "", note: str = "") -> None:
+    """Record one event.
+
+    `agent_id` is the row's SUBJECT - who the event is ABOUT, not who acted: the recipient for
+    MSG_SENT/MSG_QUEUED, the answering agent for MSG_RCVD, the downloader for FILE_RCVD. `frm`/`to`
+    are who actually SPOKE and who received it. That split is the whole point of this signature -
+    the page used to carry one bold name per row and let every call site write its own prose for
+    the rest, which is how FILE_SENT came to print an offline recipient where the uploader belonged
+    and a human reading the column was handed a false sentence. `agent_id` keeps its pre-v1.10
+    meaning unchanged because GET /logs/<t>/events.json and GET /events/mine are agent-facing.
+
+    `direction` is now a parenthetical QUALIFIER ("HTTP task", "socket open", "deduped"). The path
+    itself is derived from frm/to, so the string a human reads and the fields a machine reads
+    cannot disagree - structurally, not by discipline. Pass it positionally with no frm/to and the
+    row keeps its pre-v1.10 shape.
+
+    `ref` is a msg_id/file_id that belongs in its own column, not glued to the front of the payload.
+    `note` carries the long explanation: `payload` stays terse for the page, `payload_full` gets
+    both, so a structured consumer reads exactly what a human used to.
+    """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    d_frm, _ = _who(frm)
+    d_to, _ = _who(to)
+    if frm or to:
+        path = f"{d_frm} -> {d_to}"
+        dir_out = f"{path} ({direction})" if direction else path
+    else:
+        dir_out = direction
     full = payload or ""
     summary = full[:160].replace("\n", " ")
-    expandable = full != summary
+    expandable = full != summary or bool(note)
     if expandable:
         summary += " …"
-        clipped = full[:4000] + (" …[truncated]" if len(full) > 4000 else "")
-        detail = f"<div class='full'>{html_mod.escape(clipped)}</div>"
-    else:
-        detail = ""
-        clipped = full
-    row = (f"<div class='row{' exp' if expandable else ''}'><span class='ts'>{ts}</span>"
-           f"<span class='badge b-{event}'>{event}</span>"
-           f"<span class='aid'>{html_mod.escape(agent_id or '-')}</span>"
-           f"<span class='dir'>{html_mod.escape(direction)}</span>"
-           f"<span class='pl'>{html_mod.escape(summary)}</span>{detail}</div>")
+    clipped = full[:4000] + (" …[truncated]" if len(full) > 4000 else "")
+    if note:
+        clipped = f"{clipped} - {note}" if clipped else note
+    row = {"ts": ts, "event": event, "agent": agent_id or "-",
+           "dir": dir_out, "payload": summary,
+           # structured consumers (agents) used to get ONLY the 160-char
+           # summary while the human page carried 4000 - task bodies were
+           # unrecoverable from any JSON endpoint. Additive key.
+           "payload_full": clipped,
+           # v1.10 additive: the ends as given, so a consumer resolves ids itself instead of
+           # parsing a sentence. The row dict becomes IMMUTABLE here - EVENT_INDEX and every JSON
+           # response hand out this same object, so fold/filter/group must work on copies of the
+           # list and never rewrite a row.
+           "frm": frm, "to": to, "ref": ref}
     with log_lock:
-        LOG_ROWS.append(row)
-        event_row = {"ts": ts, "event": event, "agent": agent_id or "-",
-                     "dir": direction, "payload": summary,
-                     # structured consumers (agents) used to get ONLY the 160-char
-                     # summary while the human page carried 4000 - task bodies were
-                     # unrecoverable from any JSON endpoint. Additive key.
-                     "payload_full": clipped}
-        LOG_EVENTS.append(event_row)
+        LOG_EVENTS.append(row)
         global log_page_dirty, LOG_SEQ
         LOG_SEQ += 1
-        _index_event(agent_id, direction, event_row, LOG_SEQ)
+        _index_event(row, LOG_SEQ)
         log_page_dirty = True
     if LOG_WRITE_INTERVAL_SECONDS == 0:
         flush_log_page()           # legacy write-per-event, but still off the lock
@@ -371,18 +636,21 @@ def log_event(event: str, agent_id: str, direction: str, payload: str = "") -> N
 
 def flush_log_page() -> None:
     """Best-effort refresh of the on-disk mirror. Takes the rows under log_lock (a list of
-    references, microseconds) and does the join + write WITHOUT it, because a 13 MB page build
-    and a blocking write must not be what an event or request waits on. The rings are the source
-    of truth and /logs renders from them, so a failed write (disk full, path replaced by a
+    references, microseconds) and does the build + write WITHOUT it, because a 13 MB page render
+    and a blocking write must not be what an event or request waits on. The ring is the source
+    of truth and /logs renders from it, so a failed write (disk full, path replaced by a
     directory, perms) must NEVER fail the request or socket event that logged - an unguarded
-    write_text here used to 500 every upload/relay/message the moment LOG_FILE went unwritable."""
+    write_text here used to 500 every upload/relay/message the moment LOG_FILE went unwritable.
+    """
     global log_page_dirty, log_write_warned_at, log_written_rows, log_mirror_writes
     with log_lock:
-        if not log_page_dirty and len(LOG_ROWS) == log_written_rows:
+        if not log_page_dirty and len(LOG_EVENTS) == log_written_rows:
             return
-        snapshot = list(LOG_ROWS)
+        snapshot = list(LOG_EVENTS)
         log_page_dirty = False
     try:
+        # filt=None: the mirror is the whole ring, unfiltered. The route caps what one GET renders;
+        # this file must not, because it is the only durable copy an operator has.
         LOG_FILE.write_text(_render_log(snapshot), encoding="utf-8")
         log_written_rows = len(snapshot)
         log_mirror_writes += 1     # surfaced in /health: writes are bounded by cadence, not events
@@ -629,15 +897,18 @@ def reap_expired_tasks() -> None:
                     wedged.append(dict(entry))
                     dead_letter_put(entry, "acked_silence")
         for entry in dead:
-            log_event("TASK_EXPIRED", entry["agent"].partition(":")[2],
-                      "Server -> Agent (task abandoned)",
+            log_event("TASK_EXPIRED", entry["agent"].partition(":")[2], "task abandoned",
                       f"[{entry['msg_id']}] delivered {entry['delivered_at']}, no result ever "
-                      f"arrived within {TASK_TTL_SECONDS}s")
+                      f"arrived within {TASK_TTL_SECONDS}s",
+                      frm=entry.get("from", ""), to=entry["agent"].partition(":")[2],
+                      ref=entry["msg_id"])
         for entry in wedged:
-            log_event("TASK_WEDGED", entry["agent"].partition(":")[2],
-                      "Server -> Agent (acked, never answered)",
+            log_event("TASK_WEDGED", entry["agent"].partition(":")[2], "acked, never answered",
                       f"[{entry['msg_id']}] ACKed and nothing but ACKs since: silent for "
-                      f"{ACKED_TTL_SECONDS}s. Row kept - a late answer still lands.")
+                      f"{ACKED_TTL_SECONDS}s",
+                      note="Row kept - a late answer still lands.",
+                      frm=entry.get("from", ""), to=entry["agent"].partition(":")[2],
+                      ref=entry["msg_id"])
         retention_tick()
         unread_tick()
         # buckets only hold rows that are still in the ring, so reclaim what the ring forgot:
@@ -659,6 +930,10 @@ def retention_sweep(dry=None, actor="operator", for_agent="") -> dict:
     agents, their queues, and agent_epoch (credential revocation) are never aged - a stale
     epoch is what makes a revoked credential stay revoked.
     """
+    # the sweep is the one thing that shrinks the ring without a log_event, and the page now
+    # renders from the ring, so without this the mirror keeps serving rows the ring has dropped
+    # until the next event marks it dirty
+    global log_page_dirty
     report = {"retention_days": RETENTION_DAYS, "enabled": RETENTION_DAYS > 0}
     if RETENTION_DAYS <= 0:
         report["note"] = "HUB_RETENTION_DAYS=0: nothing ages out, only the count caps apply"
@@ -773,8 +1048,7 @@ def retention_sweep(dry=None, actor="operator", for_agent="") -> dict:
                 if not LOG_EVENTS:
                     break
                 LOG_EVENTS.popleft()
-                if LOG_ROWS:
-                    LOG_ROWS.popleft()
+            log_page_dirty = True
 
     report["removed"] = {
         "files": len(removed_files), "bytes_freed": freed,
@@ -796,12 +1070,17 @@ def retention_sweep(dry=None, actor="operator", for_agent="") -> dict:
     if total and not dry:
         LAST_SWEEP.clear()
         LAST_SWEEP.update({"at": stamp(), "actor": actor, **report["removed"]})
-        log_event("HOUSEKEEP", actor, "Server -> Server (retention sweep)",
-                  f"aged out > {RETENTION_DAYS}d: {report['removed']['files']} file(s) "
-                  f"({freed} B freed), {report['removed']['ledger_rows']} ledger row(s), "
+        # `-` keeps the subject empty on purpose: `actor` here is a TRIGGER name from the sweep
+        # call sites ("reaper", "startup", "operator"), not an agent, and passing it as the
+        # subject would mint an EVENT_INDEX bucket for a caller that can never poll.
+        log_event("HOUSEKEEP", "-", "retention sweep",
+                  f"aged out > {RETENTION_DAYS}d (trigger {actor}): "
+                  f"{report['removed']['files']} file(s) "
+                  f"({_humansize(freed)} freed), {report['removed']['ledger_rows']} ledger row(s), "
                   f"{report['removed']['log_rows']} log row(s), "
                   f"{report['removed']['inbox_messages']} queued message(s), "
-                  f"{report['removed']['retired_agent_queues']} retired queue(s)")
+                  f"{report['removed']['retired_agent_queues']} retired queue(s)",
+                  frm="hub", to="store")
     if not dry and report["removed"]["log_rows"]:
         prune_event_index()      # the sweep popped ring rows; the /events/mine index forgets them
     return report
@@ -853,10 +1132,11 @@ def mail_put(agent_id: str, sender: str, text: str) -> tuple:
     if full:
         overflow.append((agent_id, 1, "queue full"))
     for who, count, why in overflow:      # logged after meta_lock releases, like every other path
-        log_event("MSG_FAIL", who, "Server -> Mail (queue dropped)",
+        log_event("MSG_FAIL", who, "queue dropped",
                   f"queued relay(s) for '{who}' dropped ({why}): {count} message(s) are gone "
-                  f"and were never delivered - caps are {MAIL_QUEUE_MAX} per agent, "
-                  f"{MAIL_AGENTS_MAX} agents")
+                  f"and were never delivered",
+                  note=f"caps are {MAIL_QUEUE_MAX} per agent, {MAIL_AGENTS_MAX} agents",
+                  frm="mail", to=who)
     return msg["msg_id"], depth
 
 
@@ -920,9 +1200,11 @@ def unread_nudge(agent_id: str, sid: str, reason: str = "tick") -> int:
                                        "msg_id": msg["msg_id"], "queued_at": msg["ts"]},
                           to=sid, namespace=NS)
     except Exception as exc:  # noqa: BLE001 - a socket that died mid-notice is not a crash
-        log_event("MSG_FAIL", agent_id, "Server -> Agent (unread notice failed)",
-                  f"{type(exc).__name__}: {exc} - nothing was announced; this agent keeps its "
-                  f"unread items and will be told again next tick")
+        log_event("MSG_FAIL", agent_id, "unread notice failed",
+                  f"{type(exc).__name__}: {exc}",
+                  note="nothing was announced; this agent keeps its unread items and will be "
+                       "told again next tick",
+                  frm="hub", to=agent_id)
         print(f"[agent-hub] WARN: unread nudge to '{agent_id}' failed: "
               f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 0
@@ -946,10 +1228,11 @@ def unread_nudge(agent_id: str, sid: str, reason: str = "tick") -> int:
                 if not q:
                     agent_mail.pop(agent_id, None)
         nudge_total += 1
-    log_event("UNREAD_NUDGE", agent_id, "Server -> Agent (unread notice)",
-              f"[{reason}] outstanding: {payload['unread']['tasks']} task(s), "
+    log_event("UNREAD_NUDGE", agent_id, f"unread notice ({reason})",
+              f"outstanding: {payload['unread']['tasks']} task(s), "
               f"{payload['unread']['files']} file(s), {payload['unread']['relays']} relay(s) - "
-              f"announced now: {len(listed)} task(s), {len(files)} file(s), {len(mail)} relay(s)")
+              f"announced now: {len(listed)} task(s), {len(files)} file(s), {len(mail)} relay(s)",
+              frm="hub", to=agent_id)
     return len(listed) + len(files) + len(mail)
 
 
@@ -970,9 +1253,10 @@ def unread_tick() -> None:
         try:
             unread_nudge(agent_id, sid, reason="tick")
         except Exception as exc:  # noqa: BLE001 - one wedged agent must not stop the sweep
-            log_event("MSG_FAIL", agent_id, "Server -> Agent (unread notice failed)",
-                      f"{type(exc).__name__}: {exc} - this agent keeps its unread items and "
-                      f"will be told again next tick")
+            log_event("MSG_FAIL", agent_id, "unread notice failed",
+                      f"{type(exc).__name__}: {exc}",
+                      note="this agent keeps its unread items and will be told again next tick",
+                      frm="hub", to=agent_id)
 
 
 # ----------------------------------------------------------------- auth helpers
@@ -1061,8 +1345,11 @@ def scope_violation(tried: str, what: str):
     mine = own_agent()
     if not mine or mine == tried:
         return None
-    log_event("SCOPE_DENY", mine, f"Agent:{mine} -> Server (refused)",
-              f"asked for {what} belonging to '{tried}' - credentials are per-agent")
+    log_event("SCOPE_DENY", mine, "refused",
+              f"asked for {what} belonging to '{tried}'",
+              note="agent credentials are per-agent; the operator's AGENT_AUTH_TOKEN is the "
+                   "all-seeing one",
+              frm=mine, to="hub")
     return _err(403, f"this credential is '{mine}', it may not read {what} belonging to '{tried}'",
                 hint="agent credentials only cover their own agent_id (v1.5). Either connect as "
                      f"'{tried}' to get its credential, or use the operator's AGENT_AUTH_TOKEN, "
@@ -1155,7 +1442,7 @@ API_ENDPOINTS = [
      "errors": [401, 403],
      "example": "curl -s -X POST $HUB/retention/sweep -H \"Authorization: Bearer $T\" -H \"ngrok-skip-browser-warning: true\""},
     {"method": "GET", "path": "/events/mine", "auth": "token|credential",
-     "summary": "Structured event rows involving YOU (agent, source or target) - no log secret needed. With an agent credential the id comes from the credential; the operator token still passes X-Agent-Id.",
+     "summary": "Structured event rows involving YOU (agent, source or target) - no log secret needed. With an agent credential the id comes from the credential; the operator token still passes X-Agent-Id. Since v1.10 the bucket is keyed off each row's `frm`/`to`/`agent` FIELDS rather than prose, so your own downloads and the HTTP tasks you posted land here too.",
      "query": {"limit": "1-500, default 100", "mentions": "1 = also scan payload prose: the pre-index whole-ring scan, ~12x slower, and the only way to find an id that appears nowhere but the body"},
      "returns": {"keys": ["events", "count", "total_matching", "caller", "indexed", "indexed_ids", "note"]},
      "errors": [400, 401],
@@ -1163,9 +1450,16 @@ API_ENDPOINTS = [
     {"method": "GET", "path": "/client.py", "auth": "token",
      "summary": "The reference agent client (mock_agent.py) as plain Python text - read it, save it, run it.",
      "example": "curl -s $HUB/client.py -H \"Authorization: Bearer $T\" -H \"ngrok-skip-browser-warning: true\" -o mock_agent.py"},
-    {"method": "GET", "path": "/logs/{LOG_SECRET_TOKEN}", "auth": "secret path", "summary": "Auto-refreshing (5s) + auto-scrolling HTML event log. Any other token => 404."},
+    {"method": "GET", "path": "/logs/{LOG_SECRET_TOKEN}", "auth": "secret path",
+     "summary": "The operator's HTML event log, auto-refreshing (5s) + auto-scrolling. Any other "
+                "token => 404. One grammar per row (v1.10): time, EVENT badge, `FROM -> TO` "
+                "who-column computed from the row's own `frm`/`to` fields and never from prose, a "
+                "ref chip, terse payload, `?agent=&event=&q=&n=&fold=1` (mirror keeps all rows)."},
     {"method": "GET", "path": "/logs/{LOG_SECRET_TOKEN}/events.json", "auth": "secret path",
-     "summary": "Structured event log for agents.", "query": {"limit": "1-3000, default 50"}},
+     "summary": "The same rows, unrendered.",
+     "query": {"limit": "1-3000, default 50"},
+     "returns": {"keys": ["events", "count", "total", "newest_last"],
+                 "row_keys": ["ts", "event", "agent", "dir", "payload", "payload_full", "frm", "to", "ref"]}},
     {"method": "GET", "path": "/favicon.ico", "auth": "none", "summary": "Hub icon."},
 ]
 
@@ -1207,6 +1501,7 @@ FOOTGUNS = [
     "agent_id is unique since v1.4: a second live socket on a taken id is refused at connect. Check GET /agent-id/<id> first and give each process its own id (suffix the pid); force_takeover is the only way to kick a holder. A forced take-over still sends the loser `superseded`, keeps it as a standby, and hands routing back with `reactivated` if the winner dies (v1.3 chain).",
     "X-Agent-Id is a label, never a credential (v1.5): `from` on a task or peer_msg comes from the credential that authenticated - an agent's minted credential yields `agent:<id>` and nothing else, while an operator-token caller's header is self-declared and not evidence of who posted it, which is why those rows read `operator:<label>` instead of pretending to be an agent. Uniqueness (v1.4) stops routing collisions, not impersonation - only a credential proves who you are.",
     "Pick ONE stable X-Agent-Id per caller and keep sending it (`client`, or a fixed `operator`): drifting labels (`operator`, `qoder-operator`, `selftest`) make mesh attribution unreadable for whoever is on the other end, and the hub cannot fix that for you.",
+    "In a log row `agent` is the SUBJECT the row is about; `frm`/`to` are who actually spoke (v1.10). Before that the bold name on a FILE_SENT row was whoever the file was shared TO, so uploads by an offline-looking agent read as if that agent had made them, and a row whose ends appeared only in prose was missing from `GET /events/mine` entirely. Read `dir`, or filter with `?agent=`.",
     "A credential dies with its socket: it stops working when that socket disconnects, the agent_id is taken over, or the hub restarts (unless you pin HUB_CRED_SECRET). mock_agent re-mints on reconnect and on `reactivated`; a client that cached its old token will just start seeing 401s.",
     "Hub sid fields (`superseded.sid`, `reactivated.sid`, /agents `agents[id]`) are /agents-namespace sids. python-socketio clients expose the transport sid as `sio.sid`, which will NEVER match - self-check with `sio.get_sid(namespace='/agents')`.",
     "AGENT_AUTH_TOKEN is still full access for whoever holds it - the operator seat. Since v1.5 agents no longer need it for HTTP (they present the credential their socket was minted), so treat the master token as a shared root password and keep it off the wire until every agent is on a client that does. With HUB_OPERATOR_HTTP=0 it is socket-connect only.",
@@ -1458,10 +1753,14 @@ def require_actor():
         return None
     master_only = (not OPERATOR_HTTP
                    and token_eq(presented_token(), AGENT_TOKEN or ""))
-    log_event("AUTH_FAIL", actor_label(), "Client/Agent -> Server (rejected)",
+    # There is no id to name here: an invalid credential authenticates as nobody, and the
+    # master_only case is the OPERATOR being refused, not a client. actor_label() would have
+    # answered "client" for both and put that word in the agent column.
+    log_event("AUTH_FAIL", "-", "rejected",
               f"{request.method} {request.path} "
               + ("operator token not accepted over HTTP (HUB_OPERATOR_HTTP=0)"
-                 if master_only else "missing/invalid credential or AGENT_AUTH_TOKEN"))
+                 if master_only else "missing/invalid credential or AGENT_AUTH_TOKEN"),
+              frm="operator" if master_only else "client", to="hub")
     if wants_html():
         return onboarding_response(401)
     if master_only:
@@ -1535,15 +1834,19 @@ def favicon():
 #   65,440 KB cold  ->  139,012 KB with 3000 log rows x 4 KB payloads + 500 ledger rows
 #                      + 500 stored files + 200 dead-letter rows + 8 live sockets
 #               (a repeat run of the same build read 65,400 -> 139,464: the spread is ~0.5 MB)
-# The two in-memory log rings are 52.5 MB of that 74 MB growth - filled linearly at ~17.5 KB per
+# The two in-memory log rings were 52.5 MB of that 74 MB growth - filled linearly at ~17.5 KB per
 # 4 KB-payload row (8.6 KB of it string content, the rest object overhead). Ledger 252 KB, file
 # index 440 KB, dead-letter 48 KB, and the /events/mine index measured +0 KB because it stores
 # references to the ring's own row dicts rather than copies.
+# MEASURED PRE-v1.10, BEFORE the HTML ring was deleted: those numbers describe two rings and
+# bench17/ is not in this repo, so they are quoted as history, not as this build's ceiling. One
+# ring of the same cap holds strictly less than two did; re-measure before restating a figure.
 MEMORY_CEILING_KB = 139012
 MEMORY_COLD_KB = 65440
-MEMORY_DOMINATES = ("the two log rings (LOG_ROWS html + LOG_EVENTS structured): 52.5 MB of the "
-                    "74 MB growth, ~17.5 KB per 4 KB-payload row. Ledger 252 KB, file index "
-                    "440 KB, dead-letter 48 KB, events/mine index +0 KB (shared row dicts)")
+MEMORY_DOMINATES = ("the log ring (LOG_EVENTS, structured, rendered on read): it, plus the HTML "
+                    "twin this build deleted, measured 52.5 MB of a 74 MB growth, ~17.5 KB per "
+                    "4 KB-payload row. Ledger 252 KB, file index 440 KB, dead-letter 48 KB, "
+                    "events/mine index +0 KB (shared row dicts)")
 MEMORY_METHOD = ("bench17/hubload.py (live VmRSS at every cap) + bench17/memprofile.py "
                  "(per-structure deltas)")
 
@@ -1706,8 +2009,9 @@ def send_to_agent(agent_id):
     with reg_lock:
         sid = agents.get(agent_id)
     if sid is None:
-        log_event("MSG_FAIL", agent_id, "Client -> Server (agent offline)",
-                  "no persistent socket; request refused instantly")
+        log_event("MSG_FAIL", agent_id, "agent offline",
+                  "no persistent socket; request refused instantly",
+                  frm=actor_label(), to=agent_id)
         return _err(404, f"agent '{agent_id}' is offline",
                     hint=f"start it: python3 mock_agent.py --server $HUB --agent-id {agent_id} "
                          "--token $AGENT_AUTH_TOKEN ; live agents: GET /agents",
@@ -1738,12 +2042,18 @@ def send_to_agent(agent_id):
     try:
         socketio.emit("task", {"msg_id": msg_id, "from": caller, "text": text},
                       to=sid, namespace=NS)
-        log_event("MSG_SENT", agent_id, "Client -> Server -> Agent",
-                  f"[{msg_id}] {eprint_summary(text)}")
+        # `caller` was already computed for the ledger two lines up and used to be thrown away:
+        # this row said only "Client -> Server -> Agent", so 19 of the 50 MSG_SENT rows in a
+        # session named nobody, and the only way to learn who had tasked an agent was the
+        # "[hubmaster -> qoder]" prefix that senders had started typing into message bodies.
+        log_event("MSG_SENT", agent_id, "HTTP task",
+                  f"[{msg_id}] {eprint_summary(text)}",
+                  frm=caller, to=agent_id, ref=msg_id)
         if wait > 0 and pentry["event"].wait(timeout=wait):
             reply = pentry["replies"][-1] if pentry["replies"] else None
-            log_event("MSG_RCVD", agent_id, "Agent -> Server -> Client (HTTP reply)",
-                      f"[{msg_id}] {eprint_summary(reply)}")
+            log_event("MSG_RCVD", agent_id, "HTTP reply",
+                      f"[{msg_id}] {eprint_summary(reply)}",
+                      frm=agent_id, to=caller, ref=msg_id)
             status = "replied"
     finally:
         # if emit or logging raises, the error handler still owes nobody a stuck pending
@@ -1902,11 +2212,18 @@ def events_mine():
     with log_lock:
         if mentions:
             # the pre-index behaviour, kept reachable: id anywhere in the row, prose included.
+            # It must stay a SUPERSET of the index or the ?mentions=1 comparison inverts, so it
+            # tests the same three structural ends the index buckets on, then adds prose.
             # whole-word matching only: a plain substring test let agent 'lnk' see every row
             # about 'lnk-x' (prefix-collision leak between ids that share a prefix).
             tag_re = re.compile(r"(?:agent|Agent):" + re.escape(aid) + r"(?![A-Za-z0-9_-])")
+            tok_re = re.compile(r"(?<![A-Za-z0-9_-])@?" + re.escape(aid) + r"(?![A-Za-z0-9_-])")
             rows = [e for e in LOG_EVENTS
-                    if e["agent"] == aid or tag_re.search(e["dir"]) or tag_re.search(e["payload"])]
+                    if aid in (_who(e.get("agent", ""))[1], _who(e.get("frm", ""))[1],
+                               _who(e.get("to", ""))[1])
+                    or tag_re.search(e.get("dir") or "") or tok_re.search(e.get("dir") or "")
+                    or tag_re.search(e.get("payload") or "")
+                    or tok_re.search(e.get("payload") or "")]
         else:
             bucket = EVENT_INDEX.get(aid)
             if not bucket:
@@ -1925,11 +2242,14 @@ def events_mine():
     return jsonify(events=rows[-limit:], count=min(len(rows), limit), total_matching=len(rows),
                    caller=aid, indexed_ids=len(EVENT_INDEX),
                    indexed=in_index or mentions,
-                   note="rows where your id is the agent, source or target (exact-id index; "
-                        "add ?mentions=1 to also scan payload prose, which is the slow "
-                        "pre-index path; indexed=false means your id is not in the index at all, "
-                        "so re-read with ?mentions=1 before believing an empty count; "
-                        "payload_full carries up to 4000 chars)")
+                   note="rows where your id is the subject (agent), the sender (from) or the "
+                        "receiver (to) - since v1.10 those come from the row's own from/to "
+                        "fields rather than from a sentence, so an event is no longer invisible "
+                        "in your feed because the code path that wrote it worded the direction "
+                        "without an 'agent:' tag; add ?mentions=1 to also scan prose, which is "
+                        "the slow whole-ring path; indexed=false means your id is not in the "
+                        "index at all, so re-read with ?mentions=1 before believing an empty "
+                        "count; payload_full carries up to 4000 chars")
 
 
 @app.get("/client.py")
@@ -1960,7 +2280,8 @@ def relay():
         sid = agents.get(to)
     if sid is None:
         mid, depth = mail_put(to, sender, text)
-        log_event("MSG_QUEUED", to, f"{sender} -> Server -> Mail:{to}", eprint_summary(text))
+        log_event("MSG_QUEUED", to, "mail queued", eprint_summary(text),
+                  frm=sender, to=to, ref=mid)
         return jsonify(status="queued", to=to, msg_id=mid, queue_depth=depth,
                        note=f"'{to}' has no live socket, so this text was queued in memory "
                             f"(drop-oldest at {MAIL_QUEUE_MAX}) instead of dropped. It arrives as "
@@ -1970,7 +2291,7 @@ def relay():
                                "queue only drains when the agent rejoins"
                                if not UNREAD_NUDGE_SECONDS else ""))
     socketio.emit("peer_msg", {"from": sender, "text": text}, to=sid, namespace=NS)
-    log_event("MSG_SENT", to, f"{sender} -> Server -> Agent:{to}", eprint_summary(text))
+    log_event("MSG_SENT", to, "relay", eprint_summary(text), frm=sender, to=to)
     return jsonify(status="relayed", to=to)
 
 
@@ -2010,9 +2331,10 @@ def _notify_target(file_id: str, meta: dict, target: str, sender: str):
         return True, ""
     with meta_lock:
         files_unannounced[target][file_id] = stamp()
-    log_event("MSG_FAIL", target, f"{sender} -> Server (offline)",
-              f"file {meta['name']} stored; no socket to notify, the unread nudge will tell "
-              f"'{target}' about it when it connects")
+    log_event("MSG_FAIL", target, "offline",
+              f"file {meta['name']} stored; no socket to notify",
+              note="the unread nudge will tell this agent about the bytes when it connects",
+              frm=sender, to=target, ref=file_id)
     return False, (f"target agent '{target}' is offline; file stored, no notify sent - it is "
                    "queued for that agent's next unread notice")
 
@@ -2094,9 +2416,16 @@ def upload_file():
     if reused:
         delivered, target_error = _notify_target(dup, reused, target, sender)
         _record_shared(dup, target)
-        log_event("FILE_SENT", target or "-", f"{sender} -> Server (deduped)",
-                  f"{name} ({len(data)} B, sha={sha[:12]}) -> existing id {dup}, "
-                  f"pushed={delivered}")
+        # FILE_SENT's subject used to be the NOTIFY RECIPIENT while the uploader lived only in the
+        # prose - the row read "[FILE_SENT] qoder2 | agent:hubmaster -> Server -> File store" for a
+        # file hubmaster uploaded and qoder2 never received, because qoder2 had no socket that
+        # session. A human scanning the bold column read a false sentence. The uploader is now the
+        # sender end and the recipient shows as the subject chip.
+        log_event("FILE_SENT", target or "-", "deduped",
+                  f"{name} ({_humansize(len(data))}, sha={sha[:12]}"
+                  + (f", pushed={'yes' if delivered else 'no'}" if target else "") + ")",
+                  note=f"bytes already stored, reused existing id {dup}",
+                  frm=sender, to="store", ref=dup)
         out = {"status": "existing", "file_id": dup, "deduped": True, "name": name,
                "size": len(data), "sha256": sha, "delivered": delivered,
                "delivered_to": target if target else None, "download_url": f"/file/{dup}",
@@ -2107,8 +2436,10 @@ def upload_file():
         return jsonify(out), 200
 
     delivered, target_error = _notify_target(file_id, meta, target, sender)
-    log_event("FILE_SENT", target or "-", f"{sender} -> Server -> File store",
-              f"{name} ({len(data)} B, sha={sha[:12]}, pushed={delivered})")
+    log_event("FILE_SENT", target or "-", "stored",
+              f"{name} ({_humansize(len(data))}, sha={sha[:12]}"
+              + (f", pushed={'yes' if delivered else 'no'}" if target else "") + ")",
+              frm=sender, to="store", ref=file_id)
     out = {"status": "stored", "file_id": file_id, "name": name, "size": len(data),
            "sha256": sha, "delivered": delivered,
            "delivered_to": target if target else None, "download_url": f"/file/{file_id}"}
@@ -2182,8 +2513,13 @@ def download_file(file_id):
     if not path.exists():
         return _err(404, "file bytes missing from store",
                     hint=f"metadata exists but {meta['name']} is gone from disk", file_id=file_id)
-    log_event("FILE_RCVD", actor_label(), "File store -> Server -> Client/Agent",
-              f"downloaded {meta['name']} ({meta['size']} B)")
+    # The subject must be a BARE id, not actor_label()'s "agent:qoder": AGENT_ID_RE rejects the
+    # colon, so every FILE_RCVD row in a session landed in no /events/mine bucket at all and an
+    # agent could never see its own downloads.
+    who = actor_label()
+    log_event("FILE_RCVD", _who(who)[1] or "-", "download",
+              f"downloaded {meta['name']} ({_humansize(meta['size'])})",
+              frm="store", to=who, ref=file_id)
     return send_file(path, as_attachment=True, download_name=meta["name"],
                      mimetype=meta["type"])
 
@@ -2215,8 +2551,11 @@ def delete_file(file_id):
                         hint=f"index untouched; fix permissions on {path} and retry: {exc}",
                         file_id=file_id)
         persist_file_index()
-    log_event("FILE_DEL", actor_label(), "Client -> Server (file deleted)",
-              f"{meta['name']} ({meta.get('size')} B) freed")
+    who = actor_label()
+    log_event("FILE_DEL", _who(who)[1] or "-", "file deleted",
+              f"{meta['name']} ({_humansize(meta.get('size'))}) freed",
+              note="this id now 404s; other ids holding identical bytes are untouched",
+              frm=who, to="store", ref=file_id)
     return jsonify(status="deleted", file_id=file_id, name=meta["name"],
                    freed_bytes=meta.get("size"),
                    note="this id now 404s; other ids holding identical bytes are untouched")
@@ -2267,13 +2606,24 @@ def _log_token_ok(token: str) -> bool:
 @app.get("/logs/<token>")
 def logs_view(token):
     if not _log_token_ok(token):
-        log_event("AUTH_FAIL", "-", "Client -> Server (log 404)", f"invalid log token: {token[:16]!r}")
+        log_event("AUTH_FAIL", "-", "log 404", f"invalid log token: {token[:16]!r}",
+                  frm="client", to="hub")
         abort(404)
-    # serve from the memory rings: fresher than the on-disk copy, and keeps the page up
+    # serve from the memory ring: fresher than the on-disk copy, and keeps the page up
     # even while LOG_FILE is unwritable (the page auto-refreshes, so it must never 500)
+    try:
+        n = max(1, min(int(request.args.get("n", LOG_ROUTE_ROWS)), LOG_MAX_ROWS))
+    except ValueError:
+        n = LOG_ROUTE_ROWS
     with log_lock:
-        snapshot = list(LOG_ROWS)
-    return Response(_render_log(snapshot), content_type="text/html; charset=utf-8")
+        snapshot = list(LOG_EVENTS)
+    return Response(_render_log(snapshot, {
+        "agent": request.args.get("agent", "").strip()[:40],
+        "event": request.args.get("event", "").strip().upper()[:24],
+        "q": request.args.get("q", "").strip()[:64],
+        "n": n,
+        "fold": request.args.get("fold", "").lower() in ("1", "true", "yes")}),
+        content_type="text/html; charset=utf-8")
 
 
 @app.get("/logs/<token>/events.json")
@@ -2297,12 +2647,12 @@ def on_connect(auth=None):
     token = auth.get("token") or request.args.get("token", "")
     agent_id = (auth.get("agent_id") or request.args.get("agent_id", "")).strip()
     if not (AGENT_TOKEN and token_eq(str(token), AGENT_TOKEN)):
-        log_event("AUTH_FAIL", agent_id or "-", "Agent -> Server (socket rejected)",
-                  "missing/invalid AGENT_AUTH_TOKEN")
+        log_event("AUTH_FAIL", _who(agent_id)[1] or "-", "socket rejected",
+                  "missing/invalid AGENT_AUTH_TOKEN", frm=agent_id, to="hub")
         return False
     if not AGENT_ID_RE.fullmatch(agent_id):
-        log_event("AUTH_FAIL", agent_id[:40] or "-", "Agent -> Server (socket rejected)",
-                  "missing/invalid agent_id")
+        log_event("AUTH_FAIL", "-", "socket rejected", "missing/invalid agent_id",
+                  frm=agent_id[:40], to="hub")
         return False
     force = (str(auth.get("force_takeover", "")).lower() in ("1", "true", "yes")
              or request.args.get("force", "").lower() in ("1", "true", "yes"))
@@ -2338,13 +2688,15 @@ def on_connect(auth=None):
                                     "holder": holder, "reason": "duplicate agent_id"}
             while len(id_rejects) > 200:
                 id_rejects.popitem(last=False)
-        log_event("ID_REJECTED", agent_id, "Agent -> Server (socket refused)",
-                  f"duplicate agent_id; holder sid={holder[:12]} - client must choose a "
-                  f"unique id or force_takeover")
+        log_event("ID_REJECTED", agent_id, "socket refused",
+                  f"duplicate agent_id; holder sid={holder[:12]}",
+                  note="choose a unique id or set force_takeover",
+                  frm=agent_id, to="hub")
         raise ConnectionRefusedError(reason)
     if old and old != request.sid:
-        log_event("DISCONNECTED", agent_id, "Agent -> Server (replaced)",
-                  "stale socket replaced by fresh connection")
+        log_event("DISCONNECTED", agent_id, "replaced",
+                  "stale socket replaced by fresh connection",
+                  frm=agent_id, to="hub")
         try:  # tell the outgoing socket it lost routing (footgun 3 was invisible before v1.2)
             socketio.emit("superseded",
                           {"agent_id": agent_id, "reason": "duplicate agent_id re-registered",
@@ -2354,12 +2706,13 @@ def on_connect(auth=None):
                                        "'/agents'), never sio.sid"}, to=old, namespace=NS)
         except Exception:  # noqa: BLE001 - old socket may already be dead
             pass
-    log_event("CONNECTED", agent_id, "Agent -> Server (socket open)",
+    log_event("CONNECTED", agent_id, "socket open",
               # `request.transport` does not exist on a Flask request, so this used to print
               # transport=? on every connect. The engine.io handshake carries it in the query
               # string (`?EIO=4&transport=websocket`), which is what an operator wants to see:
               # whether this agent got a real WebSocket or is falling back to polling.
-              f"sid={request.sid[:12]} transport={request.args.get('transport', '?')}")
+              f"sid={request.sid[:12]} transport={request.args.get('transport', '?')}",
+              frm=agent_id, to="hub")
     # v1.5: hand this socket its own credential. Minting here also revokes whatever the socket
     # it replaced (if any) was holding, because there is exactly one live epoch per agent_id.
     deliver_credential(agent_id, request.sid)
@@ -2401,13 +2754,16 @@ def deliver_credential(agent_id: str, sid: str) -> str:
                                "It dies when this socket disconnects or when another process "
                                "takes over this agent_id."},
                       to=sid, namespace=NS)
-        log_event("CRED_MINTED", agent_id, "Server -> Agent (credential pushed)",
-                  f"agent-scoped HTTP credential for '{agent_id}' sent to socket {sid} "
-                  f"(value never logged; it rotates with this socket)")
+        log_event("CRED_MINTED", agent_id, "credential pushed", f"sid={sid[:8]}",
+                  note="agent-scoped HTTP credential sent to this socket; the value is never "
+                       "logged and it rotates with this socket",
+                  frm="hub", to=agent_id)
     except Exception as exc:  # noqa: BLE001 - a socket that cannot hear it is not worth a 500
-        log_event("CRED_FAIL", agent_id, "Server -> Agent (credential push failed)",
-                  f"{type(exc).__name__}: {exc} - this agent has no credential and will keep "
-                  f"using the operator token for HTTP")
+        log_event("CRED_FAIL", agent_id, "credential push failed",
+                  f"{type(exc).__name__}: {exc}",
+                  note="this agent has no credential and will keep using the operator token "
+                       "for HTTP",
+                  frm="hub", to=agent_id)
     return cred
 
 
@@ -2434,8 +2790,9 @@ def on_disconnect():
                 agent_superseded.pop(agent_id, None)
                 agent_epoch.pop(agent_id, None)   # nobody routes this id: its credential is dead
     if agent_id and promote:
-        log_event("CONNECTED", agent_id, "Server -> Agent (re-registered standby socket)",
-                  f"sid={promote[:12]} routing returned after the holder disconnected")
+        log_event("CONNECTED", agent_id, "standby re-registered",
+                  f"sid={promote[:12]} routing returned after the holder disconnected",
+                  frm="hub", to=agent_id)
         try:
             socketio.emit("reactivated",
                           {"agent_id": agent_id, "reason": "the socket that superseded you "
@@ -2454,8 +2811,9 @@ def on_disconnect():
         # between were announced to the winner's socket, keyed on agent_id, not to this one.
         unread_nudge(agent_id, promote, reason="reactivated")
     elif agent_id:
-        log_event("DISCONNECTED", agent_id, "Agent -> Server (socket closed)",
-                  "persistent connection dropped; future requests to this agent return 404")
+        log_event("DISCONNECTED", agent_id, "socket closed", "persistent connection dropped",
+                  note="future requests to this agent return 404 until it reconnects",
+                  frm=agent_id, to="hub")
 
 
 @socketio.on("result", namespace=NS)
@@ -2466,6 +2824,7 @@ def on_result(data=None):
     # optional intent marker: "ack" means "received", anything else (or absent) is an answer.
     # Absent-by-default keeps every pre-v1.8 client behaving exactly as it does today.
     kind = str((data or {}).get("kind") or "")[:24].lower()
+    answer_to = ""                       # who issued this task, for the log's sender/receiver ends
     row = {"from": f"agent:{agent_id}", "text": text}
     if kind:
         row["kind"] = kind
@@ -2483,6 +2842,7 @@ def on_result(data=None):
                                        "hub_issued": False, "results": [], "updated": None,
                                        "status": "first_result", "state": "acked"}
             r["results"].append(row)
+            answer_to = r.get("from") or ""
             r["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             late = r["state"] == "expired"
             r["state"] = "answered" if len(r["results"]) > 1 else "acked"
@@ -2505,8 +2865,10 @@ def on_result(data=None):
                                              "text": text})
     # one MSG_RCVD row per result: the first reply to a waiting HTTP caller is logged by that route
     if not http_will_log:
-        log_event("MSG_RCVD", agent_id, "Agent -> Server (recorded, no HTTP waiter)",
-                  f"[{msg_id}] {eprint_summary(text)}")
+        log_event("MSG_RCVD", agent_id, "recorded, no HTTP waiter",
+                  f"[{msg_id}] {eprint_summary(text)}",
+                  note=(f"kind={kind}" if kind else ""),
+                  frm=agent_id, to=answer_to or "hub", ref=msg_id)
     note_agent_traffic(agent_id)
 
 
@@ -2529,7 +2891,8 @@ def on_agent_to_client(data=None):
                 r["status"] = "answered_via_inbox"
                 if r["state"] != "expired":
                     r["state"] = "answered"
-    log_event("MSG_RCVD", agent_id, "Agent -> Server -> Client (queued)", eprint_summary(text))
+    log_event("MSG_RCVD", agent_id, "queued to client inbox", eprint_summary(text),
+              frm=agent_id, to="client", ref=str(msg_id or ""))
     note_agent_traffic(agent_id)
 
 
@@ -2544,13 +2907,13 @@ def on_agent_to_agent(data=None):
         sid = agents.get(to)
     if not sid:
         mid, depth = mail_put(to, f"agent:{sender}", text)
-        log_event("MSG_QUEUED", to, f"Agent:{sender} -> Server -> Mail:{to}",
-                  eprint_summary(text))
+        log_event("MSG_QUEUED", to, "mail queued", eprint_summary(text),
+                  frm=sender, to=to, ref=mid)
         return {"status": "queued", "to": to, "msg_id": mid, "queue_depth": depth,
                 "note": f"agent '{to}' has no live socket; queued and will arrive as "
                         "peer_msg when it rejoins or on its next unread notice"}
     socketio.emit("peer_msg", {"from": f"agent:{sender}", "text": text}, to=sid, namespace=NS)
-    log_event("MSG_SENT", to, f"Agent:{sender} -> Server -> Agent:{to}", eprint_summary(text))
+    log_event("MSG_SENT", to, "relay", eprint_summary(text), frm=sender, to=to)
     note_agent_traffic(sender)
     return {"status": "relayed", "to": to}
 
@@ -2591,7 +2954,8 @@ def http_exception(exc):
 
 @app.errorhandler(Exception)
 def server_error(exc):  # never crash a client into a hang
-    log_event("MSG_FAIL", "-", "Server -> Client (error)", f"{type(exc).__name__}: {exc}")
+    log_event("MSG_FAIL", "-", "internal error", f"{type(exc).__name__}: {exc}",
+              frm="hub", to="client")
     out = {"error": "internal server error", "hint": "retry once; if persistent check /logs or /health",
            "docs": "/llms.txt", "api": "/api"}
     if HUB_DEBUG:
@@ -2603,7 +2967,7 @@ def server_error(exc):  # never crash a client into a hang
 def _warn_localhost(reason: str) -> None:
     msg = f"{reason} - no tunnel, serving localhost only on http://localhost:{HUB_PORT}"
     print(f"[agent-hub] WARN: {msg}")
-    log_event("SERVER", "-", "Server -> Server", msg)
+    log_event("SERVER", "-", "", msg, frm="hub", to="hub")
     if HUB_BIND not in ("127.0.0.1", "localhost", "::1"):
         print(f"[agent-hub]   HUB_BIND={HUB_BIND} exposes the development server directly: "
               f"run with HUB_BIND=127.0.0.1 and publish through nginx instead")
@@ -2669,7 +3033,8 @@ def open_tunnel() -> None:
     print(f"[agent-hub]   agents:  python3 mock_agent.py --server {url} --agent-id <id> --token \"$AGENT_AUTH_TOKEN\"")
     print(f"[agent-hub]   clients: send header  ngrok-skip-browser-warning: true  on every request")
     print(f"[agent-hub] Logs are (public): {url}/logs/{LOG_SECRET}", flush=True)
-    log_event("SERVER", "-", "Server -> ngrok edge", f"public {url} -> :{HUB_PORT}")
+    log_event("SERVER", "-", "ngrok edge", f"public {url} -> :{HUB_PORT}",
+              frm="hub", to="ngrok")
 
 
 # ----------------------------------------------------------------- startup banner
@@ -2704,9 +3069,9 @@ if __name__ == "__main__":
               + f"; startup sweep removed {n} item(s)")
     else:
         print("[agent-hub] retention: disabled (HUB_RETENTION_DAYS=0) - only count caps apply")
-    log_event("SERVER", "-", "Server -> Server",
+    log_event("SERVER", "-", "startup",
               f"hub v{HUB_VERSION} started on {HUB_BIND}:{HUB_PORT} (threading mode), "
-              f"task ttl {TASK_TTL_SECONDS}s")
+              f"task ttl {TASK_TTL_SECONDS}s", frm="hub", to="hub")
     threading.Thread(target=reap_expired_tasks, daemon=True, name="task-reaper").start()
     start_log_page_writer()
     print(f"[agent-hub] v{HUB_VERSION} listening on {HUB_BIND}:{HUB_PORT} | agents socket ns={NS} | "
