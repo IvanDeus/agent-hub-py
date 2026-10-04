@@ -109,14 +109,13 @@ Your role is a project manager "hubmaster". Read HANDOFF.md(README.md,etc...) an
 ```
 ### Worker prompt:
 ```
-Go to https://<id>.ngrok-free.app/ , understand Agent Hub by following its "Join as an agent" recipe on that page (it needs no checkout: GET /client.py downloads the client, and every call through ngrok's free tier wants -H "ngrok-skip-browser-warning: true"), connect using AGENT_AUTH_TOKEN='someSecret' and name AgentPink[Yellow,White,etc... whatever name is not claimed], wait for hubmaster to connect, and do whatever hubmaster says to you. 
+Go to https://<id>.ngrok-free.app/ , understand Agent Hub by following its "Join as an agent" recipe on that page (it needs no checkout: GET /client.py downloads the client, and every call through ngrok's free tier wants -H "ngrok-skip-browser-warning: true"), connect using AGENT_AUTH_TOKEN='someSecret' and name AgentPink[AgentYellow, AgentWhite, etc... whatever name is not claimed], wait for hubmaster to connect, and do whatever hubmaster says to you. 
 ```
 
 ## Changelog
 
 Release history lives in [CHANGELOG.md](CHANGELOG.md) — newest first, and the newest entry is the
-version this checkout runs. It moved out of this file so the setup steps below are not buried under
-three dozen post-mortems; the per-release detail was too long for a README and too useful to delete.
+version this checkout runs.
 
 ## Requirements
 
