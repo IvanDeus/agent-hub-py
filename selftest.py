@@ -198,9 +198,12 @@ def main() -> int:
           f"{r.status_code} {r.headers.get('content-type')}")
     # v1.9 moved this ceiling 20,000 -> 23,000: the unread notice is a whole socket event and the
     # guard exists to catch runaway doc growth, not to keep the guide at an arbitrary size.
-    # `len(r.text)` counts CHARACTERS, not bytes - this render is 22,602 chars / 22,626 B, and
-    # labelling it "bytes" below is how a README claim once came out 24 B off its own arithmetic.
-    check("llms.txt sane size", 0 < len(llms) < 23000, f"{len(llms)} chars")
+    # v1.10 moves it 23,000 -> 24,000 for the same reason: the log row grammar, its five query
+    # params, the four new events.json row keys and the `agent` vs `frm`/`to` footgun are +947
+    # chars over the v1.9.1 render (measured: 22,602 -> 23,549 chars, 22,626 -> 23,573 B).
+    # `len(r.text)` counts CHARACTERS, not bytes - labelling it "bytes" below is how a README
+    # claim once came out 24 B off its own arithmetic.
+    check("llms.txt sane size", 0 < len(llms) < 24000, f"{len(llms)} chars")
     drift = [e["path"] for e in manifest.get("endpoints", []) if e["path"] not in llms]
     check("docs drift: every /api path appears in /llms.txt", not drift, str(drift))
 
@@ -775,6 +778,27 @@ def main() -> int:
             else:
                 check("nudge: the credential pushed with the notice can fetch the missed file",
                       False, "no url in the notice")
+            # v1.10 guards the two rows that used to state something untrue, checked where they
+            # are actually produced. FILE_SENT used to print the *notify recipient* in the bold
+            # agent column, so 41 live rows read "qoder2 | agent:hubmaster -> Server -> File
+            # store" while qoder2 was offline all session. FILE_RCVD passed agent:"qoder", which
+            # fails AGENT_ID_RE, with a direction that named nobody - so every download was
+            # bucketed in no agent's GET /events/mine at all.
+            if args.logtoken:
+                evs = jval(requests.get(f"{s}/logs/{args.logtoken}/events.json?limit=3000",
+                                        timeout=T)).get("events") or []
+                ups = [e for e in evs if e.get("ref") == miss_fid
+                       and e.get("event") == "FILE_SENT"]
+                check("v1.10 FILE_SENT credits the uploader; the target is only a subject",
+                      len(ups) == 1 and ups[0].get("frm") == "operator:selftest"
+                      and ups[0].get("to") == "store" and ups[0].get("agent") == miss_id,
+                      one_line(json.dumps(ups[:1]), 200))
+            mm = jval(requests.get(f"{s}/events/mine?limit=300", timeout=T,
+                                   headers={**auth, "X-Agent-Id": miss_id}))
+            check("v1.10 an agent's own feed carries its download (index hole closed)",
+                  any(e.get("event") == "FILE_RCVD" and e.get("ref") == miss_fid
+                      for e in mm.get("events") or []),
+                  one_line(json.dumps([e.get("event") for e in mm.get("events") or []]), 160))
             miss_cli.disconnect()
             time.sleep(1.0)
 
@@ -950,12 +974,55 @@ def main() -> int:
               r.text[:160])
         if args.logtoken:
             r = requests.get(f"{s}/logs/{args.logtoken}/events.json?limit=3000", timeout=T)
-            rows = [e for e in (jval(r).get("events") if r.ok else []) or []
+            evs = (jval(r).get("events") or []) if r.ok else []
+            rows = [e for e in evs
                     if mid in e.get("payload", "") and e.get("event") == "MSG_RCVD"]
             # An auto-reply agent emits ACK + real answer, so there may be 2 MSG_RCVD rows.
             # What matters is at least 1; zero would mean the result was silently swallowed.
             check("at least one MSG_RCVD log row per result (no silent drops)",
                   len(rows) >= 1, str(rows)[:200])
+            # v1.10: the row must say WHO CALLED. Pre-v1.10 the HTTP task path logged the
+            # literal "Client -> Server -> Agent", so 19 of 50 MSG_SENT rows had no caller
+            # anywhere and the page could not be read as a record of who said what to whom.
+            # All of this needs a real msg_id -- with the agent offline the round-trip above
+            # never ran, mid is "", and every "ref == mid" filter would match the whole ring.
+            if mid:
+                sent = [e for e in evs if e.get("event") == "MSG_SENT" and e.get("ref") == mid]
+                check("v1.10 who-column: the MSG_SENT row carries frm/to/ref as FIELDS",
+                      len(sent) >= 1 and sent[0].get("to") == args.agent
+                      and bool(sent[0].get("frm")) and "->" in sent[0].get("dir", ""),
+                      one_line(json.dumps(sent[:1]), 200))
+                rcvd = [e for e in rows if e.get("ref") == mid]
+                check("v1.10 who-column: the reply row names both ends (agent -> caller)",
+                      len(rcvd) >= 1 and rcvd[0].get("frm") == args.agent
+                      and bool(rcvd[0].get("to")),
+                      one_line(json.dumps(rcvd[:1]), 200))
+                page = requests.get(f"{s}/logs/{args.logtoken}?n=3000", timeout=T + 15)
+                check("v1.10 page: the task reads as an arrow between two named ends",
+                      page.ok and f"@{args.agent}" in page.text and f"#{mid[:16]}" in page.text,
+                      f"{page.status_code}, '@{args.agent}' "
+                      + ("there" if f"@{args.agent}" in page.text else "ABSENT"))
+                qpage = requests.get(f"{s}/logs/{args.logtoken}?q={mid}", timeout=T + 15)
+                check("v1.10 filter ?q=<msg_id> isolates the rows for one task",
+                      qpage.ok and "MSG_SENT" in qpage.text.split("<div id='log'>")[-1],
+                      f"{qpage.status_code}")
+            nopage = requests.get(f"{s}/logs/{args.logtoken}?agent=no_such_agent_zz",
+                                  timeout=T + 15)
+            nbody = nopage.text.split("<div id='log'>")[-1]
+            check("v1.10 a filter matching nothing says so instead of rendering a blank page",
+                  nopage.ok and "no rows match" in nbody.lower() and "class='row" not in nbody,
+                  f"{nopage.status_code}, body {len(nbody)} bytes")
+            probe = next((e.get("to") or e.get("frm") for e in reversed(evs)
+                          if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", e.get("to") or e.get("frm") or "")),
+                         "")
+            fpage = requests.get(f"{s}/logs/{args.logtoken}?agent={probe}&n=3000", timeout=T + 15)
+            fbody = fpage.text.split("<div id='log'>")[-1]
+            check("v1.10 filter ?agent= keeps rows naming that id",
+                  probe != "" and fpage.ok and "class='row" in fbody and f"@{probe}" in fbody,
+                  f"{fpage.status_code}, probe '{probe}', {len(fbody)} bytes")
+            f1 = requests.get(f"{s}/logs/{args.logtoken}?fold=1&n=3000", timeout=T + 15)
+            check("v1.10 ?fold=1 renders (a fold bug blanks the page, it does not error)",
+                  f1.ok and len(f1.text) > 2000 and "MSG" in f1.text, f"{f1.status_code}")
         # v1.5: an emitted task is a ledger row even if nobody answers it, and the caller
         # label comes from which credential authenticated
         r = requests.post(f"{s}/agent/{args.agent}/message?wait=0", timeout=T, headers=auth,
