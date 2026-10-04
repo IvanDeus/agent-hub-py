@@ -19,7 +19,7 @@ import secrets
 import sys
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 
@@ -39,6 +39,16 @@ def one_line(x: object, limit: int = 160) -> str:
     """Collapse whitespace and clip: a detail printed after `<-` must stay on one line."""
     flat = " ".join(str(x).split())
     return flat if len(flat) <= limit else flat[:limit].rstrip() + " ..."
+
+
+def follow_link(base_url: str, href: str) -> str:
+    """Resolve an <a href> the way a browser does, which urljoin does not: a reference starting
+    with '?' REPLACES the query (so '?' means "same page, no filter"), while urljoin cannot tell an
+    empty query from an absent one and keeps the base's. Resolving with urljoin here re-reads the
+    filtered page and reports a working clear link as broken."""
+    if href.startswith("?"):
+        return base_url.split("?", 1)[0] + href
+    return urljoin(base_url, href)
 
 
 def port_hint(base: str) -> str:
@@ -204,16 +214,37 @@ def main() -> int:
     # v1.11 moves it 24,000 -> 25,000: /logs carries a download route, the store stops being
     # scoped per agent and the ceiling is 100 MB, which is +928 chars over the v1.10 render
     # (measured: 23,549 -> 24,477 characters).
+    # v1.11.1 moves it 25,000 -> 27,000: /llms.txt now says how to GET the client you are about
+    # to run, pre-flights the agent_id and names the credential connect pushes back, which is
+    # +1,042 chars over this build's own baseline (measured: 24,699 -> 25,741 chars,
+    # 24,723 -> 25,765 B). That baseline is 222 chars ABOVE the 24,477 the v1.11 note recorded:
+    # HEAD~1 still renders 23,549 - exactly its own note - so the drift happened inside v1.11 and
+    # this suite never caught it, because a ceiling only fails when it is crossed. Headroom here is
+    # deliberately ~1,250 rather than the 12 B v1.9 ran out of.
     # `len(r.text)` counts CHARACTERS, not bytes - labelling it "bytes" below is how a README
     # claim once came out 24 B off its own arithmetic.
-    check("llms.txt sane size", 0 < len(llms) < 25000, f"{len(llms)} chars")
+    check("llms.txt sane size", 0 < len(llms) < 27000, f"{len(llms)} chars")
     drift = [e["path"] for e in manifest.get("endpoints", []) if e["path"] not in llms]
     check("docs drift: every /api path appears in /llms.txt", not drift, str(drift))
+    # The gap this closes: the guide used to say `python3 mock_agent.py ...` without ever saying the
+    # hub serves that file. An agent with a URL and a token and no checkout was stuck here.
+    check("llms.txt says how to get the client",
+          "client.py" in llms and "--check-id" in llms, llms[llms.find("Quickstart"):][:90])
 
     r = requests.get(f"{s}/", timeout=T)
     page = r.text if r.ok else ""
     check("onboarding 200 html", r.ok and "text/html" in r.headers.get("content-type", ""))
     check("voting removed from onboarding", "Vote for your own roles" not in page)
+    # The page an agent lands on has to be enough to get connected, not just to read about it:
+    # fetch the client, pre-flight the id, join, then answer with the pushed credential.
+    check("onboarding carries the agent join recipe",
+          all(m in page for m in ("Join as an agent", "/client.py", "--check-id",
+                                  "agent_token", "outbox.jsonl", "--peek")),
+          str([m for m in ("Join as an agent", "/client.py", "--check-id", "agent_token",
+                           "outbox.jsonl", "--peek") if m not in page]))
+    check("join recipe precedes the operator quick start",
+          0 < page.find("Join as an agent") < page.find("<h2>Quick start</h2>"),
+          f"join={page.find('Join as an agent')} quickstart={page.find('<h2>Quick start</h2>')}")
 
     # ---- auth negotiation
     r = requests.get(f"{s}/agents", timeout=T)  # no token
@@ -1075,6 +1106,31 @@ def main() -> int:
             f1 = requests.get(f"{s}/logs/{args.logtoken}?fold=1&n=3000", timeout=T + 15)
             check("v1.10 ?fold=1 renders (a fold bug blanks the page, it does not error)",
                   f1.ok and len(f1.text) > 2000 and "MSG" in f1.text, f"{f1.status_code}")
+            # v1.11.2: "clear" must actually clear. `href=''` resolves to the current URL INCLUDING
+            # its query string, so the click re-requested the filter it was meant to drop and the
+            # button read as dead. Followed as a browser follows it, then judged on the page that
+            # comes back - no scope line, nothing left in the form, more rows than the filter
+            # showed. Matching the href string alone would pass a link that resolves elsewhere.
+            def _rows(p):
+                m = re.search(r"class='sub'>(\d+) of (\d+) rows", p.text)
+                return int(m.group(1)) if m else -1
+
+            for cname, cqs in (("agent filter", f"?agent={probe or 'zz'}"),
+                               ("no-match filter", "?agent=no_such_agent_zz"),
+                               ("fold + search + n", "?fold=1&q=zzz&n=5")):
+                cpage = requests.get(f"{s}/logs/{args.logtoken}{cqs}", timeout=T + 15)
+                hrefs = re.findall(r"href='([^']*)'>clear", cpage.text)
+                landed = [requests.get(follow_link(cpage.url, h), timeout=T + 15) for h in hrefs]
+                before = _rows(cpage)
+                check(f"v1.11.2 the clear link drops the filter ({cname})",
+                      bool(hrefs) and all(c.ok and "filtered to" not in c.text
+                                          and "placeholder='agent id' value=''" in c.text
+                                          and "placeholder='msg_id / text' value=''" in c.text
+                                          and "name='fold'" not in c.text
+                                          and _rows(c) > before for c in landed),
+                      f"{cqs}: hrefs {hrefs} -> rows {before} became {[_rows(c) for c in landed]}, "
+                      f"scope left on any: {[('filtered-to' if 'filtered to' in c.text else '')
+                                            for c in landed]}")
         # v1.5: an emitted task is a ledger row even if nobody answers it, and the caller
         # label comes from which credential authenticated
         r = requests.post(f"{s}/agent/{args.agent}/message?wait=0", timeout=T, headers=auth,

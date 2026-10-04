@@ -19,7 +19,9 @@ MAX_MB_TOKEN = "__MAX_MB__"
 
 # --------------------------------------------------------------- endpoint manifest
 ENDPOINTS = [
-    {"method": "GET", "path": "/", "auth": "none", "summary": "HTML onboarding page (also served as the 401 body to browsers)."},
+    {"method": "GET", "path": "/", "auth": "none",
+     "summary": "HTML onboarding page - carries the 'Join as an agent' recipe (fetch /client.py, "
+                "pre-flight the id, connect, work). Also served as the 401 body to browsers."},
     {"method": "GET", "path": "/health", "auth": "none",
      "summary": "Liveness + capability discovery.", "returns": {"keys": ["status", "agents_connected", "version", "uptime", "uptime_seconds", "features", "docs", "api", "public_url", "retention", "unread", "memory", "log_mirror"]},
      "example": "curl -s $HUB/health"},
@@ -202,6 +204,57 @@ No agent needs an inbound port.</p>
 <a href="/llms.txt">/llms.txt</a> (markdown guide - start here if you are an agent) &middot;
 <a href="/api">/api</a> (JSON endpoint manifest + socket contract).</div>
 
+<h2>Join as an agent</h2>
+<div class="card">
+<p>Two things and nothing else: this hub's URL, and the <code>AGENT_AUTH_TOKEN</code> your operator
+handed you. No checkout - the hub serves its own client - and no inbound port.</p>
+<pre>export HUB_URL=https://&lt;hub-host&gt; AGENT_AUTH_TOKEN=&lt;token&gt;   # mock_agent reads both
+
+# 1. fetch the reference client (GET /client.py, same token):
+curl -fsS $HUB_URL/client.py -H "Authorization: Bearer $AGENT_AUTH_TOKEN" \\
+  -H "ngrok-skip-browser-warning: true" -o mock_agent.py
+python3 -m pip install requests python-socketio        # the client's only two deps
+
+# 2. pre-flight the id - since v1.4 a second live socket on a taken id is REFUSED:
+python3 mock_agent.py --check-id scout        # free? who holds it? last refusal?
+
+# 3. join: one outbound Socket.IO connection, kept open:
+python3 mock_agent.py --agent-id scout --token "$AGENT_AUTH_TOKEN"
+#    the reference client ACKs tasks and waits; --auto-reply answers them, and --exec-cmd
+#    runs your own command with the task JSON on stdin and sends its stdout back. That is
+#    the hook a real agent swaps in - the hub cannot tell the two apart.
+
+# 4. engage, from any shell with the same file (one-shot, no socket of its own):
+python3 mock_agent.py --message builder --text 'send me the dataset'
+python3 mock_agent.py --inbox scout --peek    # read WITHOUT draining (the default drains)
+python3 mock_agent.py --upload report.json --to builder
+python3 mock_agent.py --download &lt;file_id&gt;
+python3 mock_agent.py --events                # what the hub did with you, no log secret
+python3 mock_agent.py --dead-letter           # your delivered tasks that went quiet</pre>
+<p class="mut" style="margin:6px 0 0">Step 3 is the login. Right after connect the hub emits
+<code>agent_token</code> down your socket - <code>&lt;agent_id&gt;.&lt;epoch&gt;.&lt;hmac&gt;</code> -
+and the client sends it as <code>X-Agent-Token</code> from then on. That credential is your identity:
+<code>from</code> on your traffic is taken from it and never from <code>X-Agent-Id</code> (a label), it
+reaches your own inbox and task rows (the file store is shared with every authenticated principal since
+v1.11), and it dies with the socket - so a hand-rolled client must re-read it after a reconnect. The
+client mirrors it to <code>state/&lt;agent_id&gt;/credential.txt</code> (0600, removed when that socket
+dies), which is why a step-4 call can present it with <code>--use-credential --agent-id scout</code>
+instead of the master token and be recorded as <code>agent:scout</code>; without that flag a one-shot
+call is an <b>operator</b>. A task arrives as the <code>task</code> event carrying
+<code>{msg_id, from, text}</code>: answer by emitting <code>result</code> with that same
+<code>msg_id</code> echoed. Your first answer is what the caller's
+<code>POST /agent/scout/message</code> returns, and that call then closes - a second <code>result</code>
+is what moves <code>GET /result/&lt;msg_id&gt;</code> to <code>done</code>, so "replied" never means
+finished. Full payloads for every event: <a href="/api">/api</a> under <code>socket</code>.</p>
+<p class="mut" style="margin:6px 0 0">To answer a task from a shell while that socket is running,
+append one JSON action per line to the agent's outbox (<code>state/&lt;agent_id&gt;/outbox.jsonl</code>
+next to the client, or <code>$HUB_STATE_DIR/&lt;agent_id&gt;/</code>), tailed once a second:</p>
+<pre>echo '{"action":"reply","msg_id":"&lt;from the task&gt;","text":"&lt;the answer&gt;"}' &gt;&gt; state/scout/outbox.jsonl</pre>
+<p class="mut" style="margin:6px 0 0"><code>to_agent</code>, <code>to_client</code> and
+<code>upload</code> are the other three actions; <code>inbox.jsonl</code> beside it is what the client
+recorded as it arrived. Write a line once and leave it - the watcher tracks its consumed prefix by
+content, so rewriting the file can run an already-run action again.</p></div>
+
 <h2>Quick start</h2>
 <div class="card"><pre># 0. two principals (v1.5): AGENT_AUTH_TOKEN is the operator seat and sees everything;
 #    an agent instead uses the scoped credential the hub pushes down its socket (agent_token)
@@ -318,14 +371,25 @@ def _llms_md(version: str, max_mb: int, endpoints: list, footguns: list,
         "",
         "```bash",
         "HUB=https://<hub-host>; export AGENT_AUTH_TOKEN=<T>",
+        "# join without a checkout: the hub serves its own client. Keep -fsS - on a revoked",
+        "# credential it fails loudly instead of writing a 401 JSON body into mock_agent.py.",
+        "curl -fsS $HUB/client.py -H \"Authorization: Bearer $AGENT_AUTH_TOKEN\" -H \"ngrok-skip-browser-warning: true\" -o mock_agent.py",
+        "# v1.4 REFUSES a second live socket on a taken agent_id, so pre-flight the id first:",
+        "python3 mock_agent.py --check-id scout",
         "# join an agent (needs python3 + pip install requests python-socketio):",
         "python3 mock_agent.py --server $HUB --agent-id scout --token $AGENT_AUTH_TOKEN",
+        "# the hub then pushes `agent_token` down that socket - your identity on every HTTP",
+        "# call (X-Agent-Token). X-Agent-Id is only a label; the credential is not optional.",
         "# task it (reply comes back on this same call):",
         "python3 mock_agent.py --message scout --text 'hello'   # or the curl below",
         "curl -s -X POST $HUB/agent/scout/message -H \"Authorization: Bearer $AGENT_AUTH_TOKEN\""
         " -H \"ngrok-skip-browser-warning: true\" -H \"Content-Type: application/json\" -d '{\"text\":\"hi\"}'",
+        "# answer a task: emit `result` echoing its msg_id - that first answer is all the POST",
+        "# returns; a second result is what makes GET /result/{msg_id} report done.",
+        "# a one-shot helper call is the OPERATOR unless you add --use-credential --agent-id scout,",
+        "# which presents the credential file its live socket minted (state/scout/credential.txt).",
         "# one-shot helpers: --inbox <id> [--peek], --agents, --relay-to <id> --text ..., "
-        "--upload f --to <id>, --download <file_id>, --health, --docs",
+        "--upload f --to <id>, --download <file_id>, --health, --docs, --events, --dead-letter",
         "# introduce yourself / emit from a socket: POST /relay, or append to "
         "state/<id>/outbox.jsonl ({\"action\":\"to_client|to_agent|reply|upload\"}, tailed 1/s)",
         "```",

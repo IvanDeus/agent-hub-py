@@ -96,7 +96,7 @@ NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")  # optional: public tunn
 NGROK_DOMAIN = os.environ.get("NGROK_DOMAIN", "")        # optional: reserved ngrok domain (stable URL)
 HUB_DEBUG = os.environ.get("HUB_DEBUG", "") == "1"       # 500 responses include exception detail
 
-HUB_VERSION = "1.11.0"
+HUB_VERSION = "1.11.2"
 FEATURES = ["llms_txt", "api_manifest", "json_errors", "method_405", "inbox_peek",
             "agents_detail", "upload_sha256", "autojson_name", "file_index",
             "events_json", "ngrok_domain", "result_lookup", "events_mine",
@@ -493,7 +493,7 @@ def _render_log(rows, filt=None, dl=None) -> str:
         out.append(_log_row_html(row, repeat, dl))
         i = j
     body = "".join(out) or f"<div class='empty'>no rows match this filter ({len(rows)} in the ring)" \
-                           f" &middot; <a href=''>clear</a></div>"
+                           f" &middot; <a href='?'>clear</a></div>"
     tz = datetime.now().astimezone().tzname() or "local"
     active = any((agent, event, q))
     scope = f" &middot; filtered to {esc(agent or event or q)}" if active else ""
@@ -522,7 +522,9 @@ def _render_log(rows, filt=None, dl=None) -> str:
             f"<input name='q' placeholder='msg_id / text' value='{esc(q)}'>"
             + ("<input type='hidden' name='fold' value='1'>" if fold else "")
             + "<button>apply</button>"
-            + ("<a class='chip' href=''>clear</a>" if active or fold or limit else "")
+            # href='?' = this path with an EMPTY query. href='' would resolve to the current URL
+            # including its query string, so "clear" would reload the very filter it claims to drop.
+            + ("<a class='chip' href='?'>clear</a>" if active or fold or limit else "")
             + "</form>"
             "<nav class='chips'>" + chips(agents.most_common(12), "agent") + chips(events.most_common(10), "event")
             + ("<a class='chip' href='?fold=1" + (f"&agent={quote(agent, safe='')}" if agent else "")
