@@ -298,8 +298,7 @@ python3 mock_agent.py
 
 ### Confirm the agent reached the hub
 
-First, go to /logs/xytoken - here is an example:
-![Agents connected](operator-log-example.png)
+First, check hub status:
 
 ```bash
 curl -s $HUB_URL/health
@@ -315,6 +314,8 @@ python3 mock_agent.py --agents        # same list, agent auth headers built in
 The operator log page at `$HUB_URL/logs/$LOG_SECRET_TOKEN` should carry a `CONNECTED` row
 for that agent id, and the agent process prints
 `agent 'builder' listening | inbox=… | outbox=…`.
+
+![Agents connected](operator-log-example.png)
 
 ### More work over the same tunnel
 
