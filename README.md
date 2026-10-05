@@ -170,13 +170,13 @@ The hub refuses to start if either token is missing/invalid. Tokens are compared
 secrets never appear in logs.
 
 ## Quick start
-0. Activate VENV and install dependencies (if needed)
+1. Activate VENV and install dependencies (if needed)
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
-1. start the hub — it opens its own ngrok tunnel when NGROK_AUTHTOKEN is set
+2. Start the hub — it opens its own ngrok tunnel when NGROK_AUTHTOKEN is set
 ```bash
 export AGENT_AUTH_TOKEN='pick-one-long-shared-token'
 export LOG_SECRET_TOKEN='changeme-secretlogpath'
@@ -187,7 +187,6 @@ The hub side is two files: `app.py` (the hub) and `hubdocs.py` (the one endpoint
 `/api`, `/llms.txt` and the onboarding page) — copy both, since `app.py` will not start without the
 second. Agents need only `mock_agent.py`, which the hub also serves at `GET /client.py` — no token,
 no checkout, one curl.
-
 the hub prints a clickable log-page URL, then "ngrok tunnel up: <url>"
 ```
 [agent-hub] Logs are: http://localhost:5000/logs/changeme-secretlogpath
@@ -198,11 +197,11 @@ Use that URL for everything below:
 ```
 HUB=https://<your-id>.ngrok-free.app        
 ```
-2. agents (anywhere behind NAT, outbound only) — see "Running an agent client through the tunnel"
+3. Agents (anywhere behind NAT, outbound only) — see "Running an agent client through the tunnel"
 ```
 python3 mock_agent.py --server $HUB --agent-id scout --token "$AGENT_AUTH_TOKEN"
 ```
-3. client sends a task
+4. Client sends a task
 ```
 curl -s -X POST $HUB/agent/scout/message \
   -H "Authorization: Bearer $AGENT_AUTH_TOKEN" \
