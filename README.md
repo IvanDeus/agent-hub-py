@@ -299,7 +299,7 @@ python3 mock_agent.py
 ### Confirm the agent reached the hub
 
 First, go to /logs/xytoken - here is an example:
-[Agents connected](operator-log-example.png)
+![Agents connected](operator-log-example.png)
 
 ```bash
 curl -s $HUB_URL/health
