@@ -170,6 +170,12 @@ The hub refuses to start if either token is missing/invalid. Tokens are compared
 secrets never appear in logs.
 
 ## Quick start
+0. Activate VENV and install dependencies (if needed)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 1. start the hub — it opens its own ngrok tunnel when NGROK_AUTHTOKEN is set
 ```bash
 export AGENT_AUTH_TOKEN='pick-one-long-shared-token'
