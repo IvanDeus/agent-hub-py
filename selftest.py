@@ -221,9 +221,15 @@ def main() -> int:
     # HEAD~1 still renders 23,549 - exactly its own note - so the drift happened inside v1.11 and
     # this suite never caught it, because a ceiling only fails when it is crossed. Headroom here is
     # deliberately ~1,250 rather than the 12 B v1.9 ran out of.
+    # v1.12 moves it 27,000 -> 29,000 for three honest doc additions, not one runaway paragraph:
+    # the second mail cap and what hitting either edge now answers (dropped/dropped_total/warning),
+    # the restart's unread-debt report (debt.json is why file notices survive while relay text does
+    # not), and /agents carrying engine.io's live transport. Measured on this build: 26,971 chars
+    # render against the old ceiling - 29 chars of headroom, which is the 12-B mistake again, so
+    # the number was already fiction rather than a bound. ~2,000 of headroom restored on purpose.
     # `len(r.text)` counts CHARACTERS, not bytes - labelling it "bytes" below is how a README
     # claim once came out 24 B off its own arithmetic.
-    check("llms.txt sane size", 0 < len(llms) < 27000, f"{len(llms)} chars")
+    check("llms.txt sane size", 0 < len(llms) < 29000, f"{len(llms)} chars")
     drift = [e["path"] for e in manifest.get("endpoints", []) if e["path"] not in llms]
     check("docs drift: every /api path appears in /llms.txt", not drift, str(drift))
     # The gap this closes: the guide used to say `python3 mock_agent.py ...` without ever saying the
@@ -441,12 +447,31 @@ def main() -> int:
           and all("selftest" in (e.get("agent", "") + e.get("dir", "") + e.get("payload", ""))
                   for e in ev.get("events", [])), r.text[:160])
 
-    # ---- v1.2: fetchable reference client
-    r = requests.get(f"{s}/client.py", timeout=T, headers=auth)
-    check("client.py = python source of the reference agent",
+    # ---- v1.2: fetchable reference client; v1.12: fetchable by a machine holding no secret
+    r = requests.get(f"{s}/client.py", timeout=T)
+    check("client.py = python source of the reference agent, tokenless",
           r.ok and "python" in r.headers.get("content-type", "")
           and "class Agent" in r.text and "agent_to_agent" in r.text,
           f"{r.status_code} {r.headers.get('content-type')} {r.text[:60]!r}")
+    # The route is open now, so the thing worth asserting is that nothing secret rides in the file:
+    # mock_agent takes its token from env/argv, and a leak here would hand the master token to every
+    # crawler that finds /client.py.
+    check("the anonymously served client carries no secret in its bytes",
+          r.ok and args.token not in r.text and "Bearer " + args.token not in r.text,
+          f"{len(r.text)} B served")
+    # The anonymous surface is a security property, so it is pinned rather than implied: exactly
+    # these routes answer with no principal, and nothing else on the manifest may join them.
+    open_paths = {e["path"] for e in manifest.get("endpoints", []) if e.get("auth") == "none"}
+    check("manifest's auth:'none' set is exactly the six documented anonymous routes",
+          open_paths == {"/", "/health", "/api", "/llms.txt", "/favicon.ico", "/client.py"},
+          str(sorted(open_paths)))
+    gated = [e for e in manifest.get("endpoints", [])
+             if e.get("auth") != "none" and e["method"] == "GET"
+             and "{" not in e["path"]]
+    refused = [e["path"] for e in gated
+               if requests.get(f"{s}{e['path']}", timeout=T).status_code != 401]
+    check("every other GET 401s with no credential (no anonymous hole)",
+          not refused, str(refused[:4]))
 
     # ---- v1.2: new endpoints documented
     paths = {e["path"] for e in manifest.get("endpoints", [])}
@@ -598,12 +623,12 @@ def main() -> int:
                 ok_cred = bool(alice_box["cred"])
                 check("socket agent got a v1.5 credential pushed", ok_cred, "no agent_token")
                 tip = str((alice_box["tok"] or {}).get("client") or "")
-                check("handshake pushes a ready /client.py fetch, authorized by that credential",
-                      "/client.py" in tip and "Bearer" in tip
-                      and str(alice_box["cred"]) in tip, tip[:150])
+                check("handshake pushes a ready /client.py fetch that needs no secret (v1.12)",
+                      "/client.py" in tip and "Bearer" not in tip
+                      and str(alice_box["cred"]) not in tip, tip[:150])
                 r = requests.get(f"{s}/client.py", timeout=T + 15,
                                  headers={**hdr, "X-Agent-Token": alice_box["cred"]})
-                check("the pushed credential can actually download the reference client",
+                check("a client that still sends its credential is not turned away",
                       r.ok and "socketio" in r.text and len(r.text) > 2000,
                       f"{r.status_code} {len(r.text)} B")
                 r = requests.post(f"{s}/agent/{probe_b}/message", timeout=T + 15,

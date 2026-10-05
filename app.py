@@ -43,6 +43,7 @@ LOG_FILE = Path(os.environ.get("HUB_LOG_FILE") or BASE_DIR / "logs.html")
 FILE_STORE.mkdir(parents=True, exist_ok=True)
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 INDEX_FILE = FILE_STORE / "index.json"
+DEBT_FILE = FILE_STORE / "debt.json"
 FAVICON_FILE = BASE_DIR / "favicon.ico"
 FAVICON_ROUTE = "/favicon.ico"
 
@@ -96,7 +97,7 @@ NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")  # optional: public tunn
 NGROK_DOMAIN = os.environ.get("NGROK_DOMAIN", "")        # optional: reserved ngrok domain (stable URL)
 HUB_DEBUG = os.environ.get("HUB_DEBUG", "") == "1"       # 500 responses include exception detail
 
-HUB_VERSION = "1.11.2"
+HUB_VERSION = "1.12.0"
 FEATURES = ["llms_txt", "api_manifest", "json_errors", "method_405", "inbox_peek",
             "agents_detail", "upload_sha256", "autojson_name", "file_index",
             "events_json", "ngrok_domain", "result_lookup", "events_mine",
@@ -109,7 +110,9 @@ FEATURES = ["llms_txt", "api_manifest", "json_errors", "method_405", "inbox_peek
             "log_write_debounce", "result_ack_kind", "awaiting_answer_state",
             "events_mine_index", "events_mine_index_reclaim", "connect_client_hint",
             "unread_nudge", "relay_queue", "log_who_column", "events_from_to",
-            "log_filters", "upload_100mb", "shared_file_store", "log_file_download"]
+            "log_filters", "upload_100mb", "shared_file_store", "log_file_download",
+            "live_socket_transport", "relay_cap_loss_report", "durable_unread_debt",
+            "public_client_source"]
 STARTED_AT = time.time()
 
 ALLOWED_EXT = (".json", ".txt", ".html", ".htm", ".tar.gz", ".tgz")
@@ -142,13 +145,18 @@ INBOX_QUEUE_MAX = 200
 # validated at connect - reads must use .get() so a probe cannot mint keys (see agent_inbox).
 client_inboxes = defaultdict(lambda: deque(maxlen=INBOX_QUEUE_MAX))   # agent_id -> agent->client msgs
 # What the unread nudge reads. agent_mail is the store-and-forward that replaced dropping a
-# relay to an offline agent (memory-only, like client_inboxes - a hub restart loses it).
+# relay to an offline agent (memory-only, like client_inboxes - a hub restart loses the text, and
+# load_unread_debt reports how much).
 # files_unannounced remembers which stored bytes were addressed to an id that had no socket at
 # upload time: the bytes are durable in file_meta, only the notice was lost, so this tracks the
-# notice and nothing else. nudged is the never-twice ledger - without it one task that sits
+# notice and nothing else - and since v1.12 the notice itself is durable too (debt.json),
+# because a restart that silently drops it strands bytes nobody can be told about again.
+# nudged is the never-twice ledger - without it one task that sits
 # unanswered for a day would nag its agent every 45 seconds.
 agent_mail = OrderedDict()   # agent_id -> deque(maxlen=MAIL_QUEUE_MAX) of {msg_id, from, text, ts}
 files_unannounced = defaultdict(OrderedDict)   # agent_id -> {file_id: iso} no socket ever heard
+restart_forfeits = {}        # what the PREVIOUS process held that this one cannot hand back
+mail_dropped = {"id_cap": 0, "queue_full": 0}   # this process only: relays the caps destroyed
 nudged_tasks = OrderedDict()  # "<agent_id>|<msg_id>" -> iso, capped like id_rejects. Only tasks
                               # need it: a queued relay leaves the queue when flushed and an
                               # unannounced file leaves files_unannounced when announced, so both
@@ -785,16 +793,94 @@ def persist_file_index() -> None:
         print(f"[agent-hub] WARN: file index persist failed: {exc}")
 
 
+def persist_debt_locked() -> None:
+    """Caller holds meta_lock. The unannounced-file markers are the one piece of the nudge's
+    memory with a durable counterpart: the bytes they name live in FILE_STORE and survive a
+    restart, so losing the marker is what turned a missed notice into a permanently silent one.
+    Written beside index.json. Queue DEPTHS travel with it but never their bodies - relay text
+    and inbox messages stay memory-only, and what a restart cost is then reported, not hidden.
+    """
+    try:
+        tmp = DEBT_FILE.with_name(DEBT_FILE.name + ".tmp")
+        tmp.write_text(json.dumps({
+            "files_unannounced": {aid: dict(p) for aid, p in files_unannounced.items() if p},
+            "mail_depth": {aid: len(q) for aid, q in agent_mail.items() if q},
+            "inbox_depth": {aid: len(q) for aid, q in client_inboxes.items() if q},
+            "written": stamp()}, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, DEBT_FILE)
+    except Exception as exc:  # noqa: BLE001 - a debt hiccup must not fail the write that succeeded
+        print(f"[agent-hub] WARN: unread debt persist failed: {exc}")
+
+
+def load_unread_debt() -> None:
+    """Startup, after load_file_index(): take back the announcement debt the last process owed.
+    Markers naming bytes that no longer exist are dropped - there is nothing left to announce."""
+    global restart_forfeits
+    try:
+        with DEBT_FILE.open(encoding="utf-8") as f:
+            stored = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001 - a broken debt file must never stop the hub
+        print(f"[agent-hub] WARN: could not load {DEBT_FILE.name}: {exc}")
+        return
+    if not isinstance(stored, dict):
+        return
+    restored = orphaned = 0
+    with meta_lock:
+        for aid, marks in (stored.get("files_unannounced") or {}).items():
+            if not AGENT_ID_RE.fullmatch(str(aid)) or not isinstance(marks, dict):
+                continue
+            for fid, at in marks.items():
+                if fid not in file_meta:
+                    orphaned += 1
+                    continue
+                files_unannounced[aid][fid] = at
+                restored += 1
+        forfeited = {aid: n for aid, n in (stored.get("mail_depth") or {}).items() if n}
+        lost_inbox = {aid: n for aid, n in (stored.get("inbox_depth") or {}).items() if n}
+        if forfeited or lost_inbox or restored or orphaned:
+            restart_forfeits = {"queued_relays": sum(forfeited.values()),
+                                "relays_by_agent": forfeited,
+                                "inbox_messages": sum(lost_inbox.values()),
+                                "inbox_by_agent": lost_inbox,
+                                "debt_restored_files": restored,
+                                "debt_dropped_missing_bytes": orphaned,
+                                "previous_process_wrote": stored.get("written")}
+        if restored:
+            persist_debt_locked()
+    if restored or orphaned or restart_forfeits:
+        lost = restart_forfeits
+        msg = (f"unread debt restored: {restored} file notice(s) still owed"
+               + (f", {orphaned} marker(s) dropped (bytes gone)" if orphaned else "")
+               + f" | forfeited by this restart (memory only): "
+                 f"{lost.get('queued_relays', 0)} queued relay(s), "
+                 f"{lost.get('inbox_messages', 0)} undrained inbox message(s)")
+        print(f"[agent-hub] {msg}")
+        log_event("SERVER", "-", "unread debt", msg,
+                  note="file bytes are durable, so their announcement debt crossed the restart; "
+                       "queued relay text and agent->client inbox entries are memory-only and did "
+                       "not - agents reconnect to a hub that no longer owes them those. Counts "
+                       "came from the previous process's debt.json.",
+                  frm="hub", to="hub")
+
+
 def drop_file_locked(file_id: str):
-    """Caller holds meta_lock. Remove one stored object: its bytes, its index entry, and its
-    sha advisory (re-pointed at the newest surviving duplicate so ?dedupe=1 stops handing out
-    a deleted id). Returns the meta it removed, or None for an unknown id. An OSError from the
-    unlink propagates with the index still intact, so the caller can retry."""
+    """Caller holds meta_lock. Remove one stored object: its bytes, its index entry, its sha
+    advisory (re-pointed at the newest surviving duplicate so ?dedupe=1 stops handing out
+    a deleted id), and any announcement still owed for it - a debt naming bytes that no longer
+    exist is a promise to deliver a file that is gone. Returns the meta it removed, or None for
+    an unknown id. An OSError from the unlink propagates with the index still intact, so the
+    caller can retry."""
     meta = file_meta.get(file_id)
     if not meta:
         return None
     (FILE_STORE / f"{file_id}__{meta['name']}").unlink(missing_ok=True)
     file_meta.pop(file_id, None)
+    for aid in list(files_unannounced):
+        if files_unannounced[aid].pop(file_id, None) is not None:
+            persist_debt_locked()
+            break
     sha = meta.get("sha256")
     if sha and sha_index.get(sha) == file_id:
         rest = [f for f, m in file_meta.items() if m.get("sha256") == sha]
@@ -834,6 +920,22 @@ def eprint_summary(data) -> str:
 # ----------------------------------------------------------------- task ledger
 def stamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def real_transport(sid: str) -> str:
+    """What engine.io holds for this socket - 'polling', 'websocket', or '?' once it is gone.
+
+    The handshake query cannot answer this. It reports the transport the session OPENED on, and a
+    client that handshakes over long polling and then upgrades - which is what every
+    websocket-capable python-socketio client does - leaves that query saying `polling` forever
+    after the socket became a WebSocket. engine.io flips its own flag during the upgrade, before
+    the CONNECT packet this row is written for, so this is the connection's transport and not a
+    prediction of it.
+    """
+    try:
+        return socketio.server.transport(sid, namespace=NS)
+    except Exception:  # noqa: BLE001 - session reaped, or the server is not initialized yet
+        return "?"
 
 
 def note_agent_traffic(agent_id: str) -> None:
@@ -1020,7 +1122,7 @@ def retention_sweep(dry=None, actor="operator") -> dict:
 
         # The relay queue and the unannounced-file markers are the unread nudge's memory. Left
         # alone they outlive every name anyone ever relayed to, so they age the same way.
-        aged_mail, retired_ids = 0, []
+        aged_mail, retired_ids, debt_touched = 0, [], False
         for aid in set(agent_mail) | set(files_unannounced):
             msgs = list(agent_mail.get(aid) or ())
             aged_mail += sum(1 for m in msgs
@@ -1032,15 +1134,20 @@ def retention_sweep(dry=None, actor="operator") -> dict:
                 fresh = [m for m in msgs if (age_days(m.get("ts")) or 0) <= RETENTION_DAYS]
                 if len(fresh) != len(msgs):
                     agent_mail[aid] = deque(fresh, maxlen=MAIL_QUEUE_MAX)
+                    debt_touched = True
                 for fid, at in list(pend.items()):
                     if (age_days(at) or 0) > RETENTION_DAYS:
                         pend.pop(fid, None)
+                        debt_touched = True
                 if not pend:
                     files_unannounced.pop(aid, None)
         if not dry:
             for aid in retired_ids:
                 agent_mail.pop(aid, None)
                 files_unannounced.pop(aid, None)
+            # debt.json is the durable copy of exactly these two structures, so it ages with them
+            if retired_ids or debt_touched:
+                persist_debt_locked()
 
         aged_seen = [a for a, s in agent_last_seen.items()
                      if a not in live and (age_days(s) or 0) > RETENTION_DAYS]
@@ -1127,34 +1234,84 @@ def retention_tick() -> None:
 # ----------------------------------------------------------------- unread nudge (v1.9)
 def mail_put(agent_id: str, sender: str, text: str) -> tuple:
     """Queue a relay addressed to an agent with no live socket, instead of destroying it.
-    Returns (msg_id, queue_depth). Never call while holding a lock (it takes meta_lock itself).
-    Bounded twice over - 200 messages per id drop-oldest, and MAIL_AGENTS_MAX ids with the least
-    recently touched one evicted - because a caller may relay to names that never connect."""
+
+    Returns `(msg_id, queue_depth, dropped)`. `dropped` lists what this call cost somebody -
+    it is empty in the normal case. It was not always computable: both caps used to fire and the
+    caller still heard a bare `{"status":"queued"}`, so a relay to a 201st name silently executed
+    the 200 agents behind it and nothing in the response, the health view or the sender's own
+    conscience said so. The message the caller sent is genuinely queued either way; what it is
+    owed is the truth about its neighbours.
+
+    Never call while holding a lock (it takes meta_lock itself). Bounded twice over - 200 messages
+    per id drop-oldest, and MAIL_AGENTS_MAX ids with the least recently touched one evicted -
+    because a caller may relay to names that never connect.
+    """
+    global mail_dropped
     msg = {"msg_id": pysecrets.token_hex(6), "from": sender, "text": text, "ts": stamp()}
     overflow = []
     with meta_lock:
         q = agent_mail.get(agent_id)
         if q is None:
             while len(agent_mail) >= MAIL_AGENTS_MAX:
-                cold_id, cold_q = agent_mail.popitem(last=False)
-                files_unannounced.pop(cold_id, None)
-                if cold_q:
-                    overflow.append((cold_id, len(cold_q), "id cap"))
+                # Free the dead slots before eating live ones: an id whose queue drained is only
+                # sitting on a deque, and evicting it costs nobody anything.
+                cold_id = next((aid for aid, queue in agent_mail.items() if not queue), None)
+                if cold_id is None:
+                    cold_id, cold_q = agent_mail.popitem(last=False)
+                    if cold_q:
+                        overflow.append({"agent_id": cold_id, "count": len(cold_q),
+                                         "reason": "id cap",
+                                         "detail": f"the hub holds mail for {MAIL_AGENTS_MAX} "
+                                                   f"agent ids; this relay needed a slot"})
+                        mail_dropped["id_cap"] += len(cold_q)
+                agent_mail.pop(cold_id, None)
+                # files_unannounced deliberately survives: that debt names bytes on disk, and
+                # making room for one sender's new relay was never a reason to un-owe somebody
+                # a file. It ages out through the retention sweep instead.
             q = agent_mail[agent_id] = deque(maxlen=MAIL_QUEUE_MAX)
         else:
             agent_mail.move_to_end(agent_id)
         full = len(q) == q.maxlen
         q.append(msg)
         depth = len(q)
-    if full:
-        overflow.append((agent_id, 1, "queue full"))
-    for who, count, why in overflow:      # logged after meta_lock releases, like every other path
-        log_event("MSG_FAIL", who, "queue dropped",
-                  f"queued relay(s) for '{who}' dropped ({why}): {count} message(s) are gone "
-                  f"and were never delivered",
-                  note=f"caps are {MAIL_QUEUE_MAX} per agent, {MAIL_AGENTS_MAX} agents",
-                  frm="mail", to=who)
-    return msg["msg_id"], depth
+        if full:
+            overflow.append({"agent_id": agent_id, "count": 1, "reason": "queue full",
+                             "detail": f"this id's queue holds {MAIL_QUEUE_MAX} relays; the "
+                                       f"oldest was pushed out to make room for this one"})
+            mail_dropped["queue_full"] += 1
+        persist_debt_locked()
+    for item in overflow:      # logged after meta_lock releases, like every other path
+        log_event("MSG_FAIL", item["agent_id"], "queue dropped",
+                  f"queued relay(s) for '{item['agent_id']}' dropped ({item['reason']}): "
+                  f"{item['count']} message(s) are gone and were never delivered",
+                  note=f"{item['detail']} - caps are {MAIL_QUEUE_MAX} per agent, "
+                       f"{MAIL_AGENTS_MAX} agents",
+                  frm="mail", to=item["agent_id"])
+    return msg["msg_id"], depth, overflow
+
+
+def mail_loss_report(dropped: list, sender: str) -> dict:
+    """What a `queued` answer owes the sender when queueing cost somebody else their text.
+
+    The hub used to answer 200 {"status":"queued"} and keep the casualty to itself: the victim was
+    a different agent, its relays were already past their sender's hands, and the only trace was a
+    MSG_FAIL row nobody who could act on it reads. Not undoing the drop - the caps exist because
+    a caller may relay to names that never connect - but no longer un-telling the sender.
+    """
+    if not dropped:
+        return {}
+    gone = sum(int(d["count"]) for d in dropped)
+    return {
+        "dropped": dropped,
+        "dropped_total": gone,
+        "warning": (f"this relay displaced {gone} already-queued message(s) and they are gone: "
+                    + "; ".join(f"{d['count']} for '{d['agent_id']}' ({d['reason']})"
+                                for d in dropped)
+                    + f" - the hub caps mail at {MAIL_QUEUE_MAX} per agent id and "
+                      f"{MAIL_AGENTS_MAX} agent ids at once. Nothing recovers these: the sender "
+                      f"({'you' if not sender else sender}) would have to re-send them, and the "
+                      f"victims never learn they were dropped"),
+    }
 
 
 def unread_state(agent_id: str) -> dict:
@@ -1245,6 +1402,7 @@ def unread_nudge(agent_id: str, sid: str, reason: str = "tick") -> int:
                 if not q:
                     agent_mail.pop(agent_id, None)
         nudge_total += 1
+        persist_debt_locked()
     log_event("UNREAD_NUDGE", agent_id, f"unread notice ({reason})",
               f"outstanding: {payload['unread']['tasks']} task(s), "
               f"{payload['unread']['files']} file(s), {payload['unread']['relays']} relay(s) - "
@@ -1554,13 +1712,20 @@ def health():
                                             if UNREAD_NUDGE_SECONDS else None,
                            "queued_relays": queued,
                            "queued_for_agents": mail_ids,
+                           "mail_agents_max": MAIL_AGENTS_MAX,
                            "files_unannounced": unannounced,
                            "notices_total": nudge_total, "list_max": UNREAD_LIST_MAX,
                            "mail_queue_max": MAIL_QUEUE_MAX,
+                           "dropped_relays": dict(mail_dropped),
+                           "dropped_relays_total": sum(mail_dropped.values()),
+                           "restart_cost": restart_forfeits or None,
                            "note": "`enabled` is the periodic sweep only - the connect and "
                                    "reactivation notices always fire, which is why next_nudge_in "
-                                   "is null when it is off. Queued relays are memory-only: a hub "
-                                   "restart loses them."})
+                                   "is null when it is off (an agent with nothing owed gets no "
+                                   "frame at all). Queued relays are memory-only: a hub restart "
+                                   "loses their text, and restart_cost reports what the previous "
+                                   "process was holding. Unannounced FILE notices are durable "
+                                   "(debt.json) - the bytes always were."})
 
 
 @app.get("/agents")
@@ -1589,12 +1754,17 @@ def list_agents():
                    count=len(snap), agent_ids=sorted(snap),
                    detail={aid: {"sid": sid, "connected_at": since.get(aid),
                                  "last_seen": seen.get(aid),
+                                 "transport": real_transport(sid),
                                  "last_superseded_at": sup.get(aid),
                                  "standby_sockets": len(std.get(aid) or {}),
                                  "inbox_backlog": backlog.get(aid, 0),
                                  "mail_backlog": mail.get(aid, 0),
                                  "outstanding_tasks": outstanding.get(aid, 0)}
                            for aid, sid in snap.items()},
+                   transport_note="polled from engine.io for this request, so it is the socket's "
+                                  "current transport rather than what its handshake announced - "
+                                  "polling here means the agent really is falling back, not that "
+                                  "it has not upgraded yet",
                    standby=std,
                    standby_note="still-open sockets that lost an agent_id take-over; the most "
                                 "recent one reclaims routing when the holder disconnects",
@@ -1720,12 +1890,18 @@ def send_to_agent(agent_id):
             state = (row or {}).get("state", "delivered")
             deadline = (row or {}).get("deadline_at")
     out = {"status": status, "msg_id": msg_id, "agent_id": agent_id, "reply": reply,
-           "task_state": state, "result_endpoint": f"/result/{msg_id}"}
+           "task_state": state, "result_endpoint": f"/result/{msg_id}",
+           # The row carries a deadline on every path, so the caller gets it on every path:
+           # a task that was just ACKed is still tracked, and saying when it stops being
+           # tracked is the difference between polling and assuming.
+           "expires_at": deadline}
     if status == "replied":
         out["note"] = ("first result only - mock_agent auto-ACKs here; the agent's real answer "
                        "arrives later on GET /agent/%s/inbox?peek=true" % agent_id)
+        out["watch"] = (f"an ACK is not an answer: GET /result/{msg_id} keeps tracking this "
+                        f"task until {deadline}, and if nothing further lands by then the row "
+                        f"expires into GET /tasks/dead-letter anyway")
     else:
-        out["expires_at"] = deadline
         out["watch"] = (f"GET /result/{msg_id} tracks this task: state goes delivered -> acked "
                         f"-> answered, or -> expired after {TASK_TTL_SECONDS}s with nothing "
                         f"to show for it; abandoned tasks overall: GET /tasks/dead-letter")
@@ -1907,9 +2083,17 @@ def events_mine():
 
 @app.get("/client.py")
 def client_source():
-    """The reference client (mock_agent.py) one curl away, so remote agents can copy it."""
-    if deny := require_actor():
-        return deny
+    """The reference client (mock_agent.py) one curl away, so remote agents can copy it.
+
+    Deliberately the one substantive route with no principal check: a first-time agent has the hub
+    URL and nothing else, and "send me a token before I can read how to ask for a token" is the
+    bootstrap dead end this route exists to end. The file is a fixed path with no secrets in it
+    (mock_agent reads its token from env/argv), so this leaks the recipe for joining, which is
+    exactly the point - everything that acts as you still needs a credential.
+
+    Not logged: the hub may sit on a public ngrok URL, and a row per anonymous fetch would push
+    real agent traffic out of the bounded ring.
+    """
     p = BASE_DIR / "mock_agent.py"
     if not p.exists():
         return _err(404, "mock_agent.py not found next to the hub", path=request.path)
@@ -1932,7 +2116,7 @@ def relay():
     with reg_lock:
         sid = agents.get(to)
     if sid is None:
-        mid, depth = mail_put(to, sender, text)
+        mid, depth, dropped = mail_put(to, sender, text)
         log_event("MSG_QUEUED", to, "mail queued", eprint_summary(text),
                   frm=sender, to=to, ref=mid)
         return jsonify(status="queued", to=to, msg_id=mid, queue_depth=depth,
@@ -1942,7 +2126,8 @@ def relay():
                             f"unread notice - whichever comes first"
                             + (". HUB_UNREAD_NUDGE_SECONDS=0 stops the periodic sweep, so this "
                                "queue only drains when the agent rejoins"
-                               if not UNREAD_NUDGE_SECONDS else ""))
+                               if not UNREAD_NUDGE_SECONDS else ""),
+                       **mail_loss_report(dropped, sender))
     socketio.emit("peer_msg", {"from": sender, "text": text}, to=sid, namespace=NS)
     log_event("MSG_SENT", to, "relay", eprint_summary(text), frm=sender, to=to)
     return jsonify(status="relayed", to=to)
@@ -1966,7 +2151,9 @@ UPLOAD_HOWTO = ('send multipart -F file=@report.json OR raw bytes with -H "X-Fil
 def _notify_target(file_id: str, meta: dict, target: str, sender: str):
     """Push a file_ready notice to `target`. Returns (delivered, target_error). A target that
     had no socket is recorded in `files_unannounced` so the unread nudge can tell it about the
-    bytes when it rejoins - the file was always durable, only the notice was ever lost."""
+    bytes when it rejoins. The bytes were always durable and the notice now is too (debt.json):
+    a hub restart used to forgive this debt out from under the agent, which left stored files
+    nobody was ever going to be told about again."""
     if not target:
         return False, ""
     if not AGENT_ID_RE.fullmatch(target):
@@ -1981,15 +2168,18 @@ def _notify_target(file_id: str, meta: dict, target: str, sender: str):
             heard = files_unannounced.get(target)
             if heard is not None:
                 heard.pop(file_id, None)     # it heard about this file directly: nothing owed
+                persist_debt_locked()
         return True, ""
     with meta_lock:
         files_unannounced[target][file_id] = stamp()
+        persist_debt_locked()
     log_event("MSG_FAIL", target, "offline",
               f"file {meta['name']} stored; no socket to notify",
               note="the unread nudge will tell this agent about the bytes when it connects",
               frm=sender, to=target, ref=file_id)
     return False, (f"target agent '{target}' is offline; file stored, no notify sent - it is "
-                   "queued for that agent's next unread notice")
+                   "queued for that agent's next unread notice, and that promise now survives "
+                   "a hub restart")
 
 
 def _record_shared(file_id: str, target: str) -> None:
@@ -2372,12 +2562,17 @@ def on_connect(auth=None):
                                        "'/agents'), never sio.sid"}, to=old, namespace=NS)
         except Exception:  # noqa: BLE001 - old socket may already be dead
             pass
+    transport = real_transport(request.sid)
     log_event("CONNECTED", agent_id, "socket open",
-              # `request.transport` does not exist on a Flask request, so this used to print
-              # transport=? on every connect. The engine.io handshake carries it in the query
-              # string (`?EIO=4&transport=websocket`), which is what an operator wants to see:
-              # whether this agent got a real WebSocket or is falling back to polling.
-              f"sid={request.sid[:12]} transport={request.args.get('transport', '?')}",
+              # This row used to echo the handshake query's `transport=`, and for every client
+              # that handshakes over long polling and then upgrades, that query says `polling` for
+              # the rest of the session - so the hub called a live WebSocket agent a polling one on
+              # every single connect, and the log was enough to conclude WebSockets did not work
+              # here. engine.io knows which transport the socket is actually on.
+              f"sid={request.sid[:12]} transport={transport}",
+              note="engine.io's transport for this socket, not the transport its handshake opened "
+                   "with; `polling` here means the agent genuinely has no WebSocket - live value: "
+                   "GET /agents",
               frm=agent_id, to="hub")
     # v1.5: hand this socket its own credential. Minting here also revokes whatever the socket
     # it replaced (if any) was holding, because there is exactly one live epoch per agent_id.
@@ -2388,17 +2583,19 @@ def on_connect(auth=None):
     unread_nudge(agent_id, request.sid, reason="connect")
 
 
-def _client_hint(agent_id: str, cred: str) -> dict:
-    """One command a freshly connected agent can run to get the reference client. Keyed off
-    the credential it was just handed, so the master token never re-enters the picture."""
+def _client_hint() -> dict:
+    """One command a freshly connected agent can run to get the reference client. Needs no secret:
+    `GET /client.py` is anonymous since v1.12, so the hint cannot be the thing that leaks a
+    credential into a shell history line."""
     hub = (TUNNEL_URL or f"http://localhost:{HUB_PORT}").rstrip("/")
     return {
-        "fetch": f'curl -fsS {hub}/client.py -H "Authorization: Bearer {cred}" '
+        "fetch": f'curl -fsS {hub}/client.py '
                  f'-H "ngrok-skip-browser-warning: true" -o mock_agent.py',
-        "auth_note": "that credential alone authorizes GET /client.py - you are already a "
-                     "principal, so no AGENT_AUTH_TOKEN needed. -fsS so a dead credential (the "
-                     "handshake hint only lives as long as your socket) fails loudly instead of "
-                     "writing a 401 JSON body into mock_agent.py",
+        "auth_note": "GET /client.py is open to anyone with the hub URL (v1.12) - the code to join "
+                     "is not a secret, your credential is. -fsS so a dead URL fails loudly instead "
+                     "of writing an ngrok error page into mock_agent.py",
+        "credential_note": "the `token` in this same message is what authorizes every OTHER call; "
+                           "keep it out of the fetch command and out of shell history",
         "action_note": "a client that already has its own connect code does not need this; "
                        "it is for an agent that wants the reference implementation",
         "emit_without_a_socket": f"POST {hub}/relay, or append one JSON per line to "
@@ -2414,7 +2611,7 @@ def deliver_credential(agent_id: str, sid: str) -> str:
     try:
         socketio.emit("agent_token",
                       {"agent_id": agent_id, "token": cred,
-                       "client": _client_hint(agent_id, cred),
+                       "client": _client_hint(),
                        "note": "send this as X-Agent-Token on HTTP. It proves who you are, so "
                                "`from` is taken from it rather than from your X-Agent-Id header. "
                                "It dies when this socket disconnects or when another process "
@@ -2572,12 +2769,13 @@ def on_agent_to_agent(data=None):
     with reg_lock:
         sid = agents.get(to)
     if not sid:
-        mid, depth = mail_put(to, f"agent:{sender}", text)
+        mid, depth, dropped = mail_put(to, f"agent:{sender}", text)
         log_event("MSG_QUEUED", to, "mail queued", eprint_summary(text),
                   frm=sender, to=to, ref=mid)
         return {"status": "queued", "to": to, "msg_id": mid, "queue_depth": depth,
                 "note": f"agent '{to}' has no live socket; queued and will arrive as "
-                        "peer_msg when it rejoins or on its next unread notice"}
+                        "peer_msg when it rejoins or on its next unread notice",
+                **mail_loss_report(dropped, sender)}
     socketio.emit("peer_msg", {"from": f"agent:{sender}", "text": text}, to=sid, namespace=NS)
     log_event("MSG_SENT", to, "relay", eprint_summary(text), frm=sender, to=to)
     note_agent_traffic(sender)
@@ -2722,6 +2920,7 @@ def announce_log_urls() -> None:
 if __name__ == "__main__":
     init_log_file()
     load_file_index()
+    load_unread_debt()
     # Every agent is nudged at connect, so let the first tick come a full cadence after boot
     # instead of on the reaper's first 15s pass, which would address every socket at once.
     _next_nudge_at = STARTED_AT + UNREAD_NUDGE_SECONDS

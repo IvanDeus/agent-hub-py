@@ -10,6 +10,64 @@ Each entry says what moved, what it cost and how it was measured. The version at
 ([hubdocs.py](hubdocs.py)). So a live hub's own `/api` is the contract it actually serves; this file
 is the history of how it got there, not a second source of truth to drift.
 
+- **v1.12.0** — four things the hub said that were not true, and one thing it made harder than it
+  needed to be, each measured against a live hub before and after. **(a) `CONNECTED` reported the wrong transport.** The row echoed
+  `request.args['transport']`, which is what the session *handshaked* on; a client that handshakes
+  over long polling and upgrades — every websocket-capable python-socketio client — leaves that
+  query reading `polling` for the rest of its life. 17 of 17 `CONNECTED` rows in a live session said
+  `transport=polling`, including agents whose sids never once appeared in an HTTP request line, so
+  reading the log was enough to conclude the hub could not do WebSockets. It now asks engine.io
+  (`socketio.server.transport(sid, NS)`, `app.py:926`), which has already flipped its `upgraded`
+  flag by the time the CONNECT packet lands: the same two clients show `transport=websocket` and
+  `transport=polling` respectively, and `GET /agents` gained `detail.<id>.transport` answering the
+  same question on demand, because a log row is a snapshot of one instant. **(b) `POST
+  /agent/<id>/message` withheld `expires_at` on the `replied` path** while README promised it on
+  every call — and the deadline was already computed three lines up and used only for the other
+  branch. It ships now on both paths, with a `watch` line for `replied` that says what an ACK is
+  not, and `/api`'s honest `expires_at (only when not replied)` became the lie it was fixing.
+  **(c) a queued relay could destroy other agents' relays and say nothing.** The mail queue is
+  capped twice — 200 per id and 200 ids holding mail — and the second cap was undocumented while
+  `mail_put` evicted the coldest id *with its live backlog*, then answered the sender a bare
+  `200 {"status":"queued"}`. Both edges now return `dropped[] / dropped_total / warning` naming
+  whose text died (`app.py:1293`), `/health.unread.dropped_relays` counts them by reason, eviction
+  frees drained id slots before touching live ones, and an evicted id keeps its file debt — mail
+  pressure was never a reason to un-owe somebody a file. Driven for real on a live hub: the 201st
+  id answers `1 for 'capid-000' (id cap)`, the 201st relay to one id answers `reason:"queue full"`,
+  and `/health` reads `{'id_cap': 1, 'queue_full': 1}`. **(d) a hub restart silently forfeited the
+  unread-recovery promise.** The bytes in `file_store` survived, `index.json` survived, and the
+  *memory of who had never been told about them* did not: `files_unannounced` was a plain dict, so
+  after a restart stored files were nobody's business again and no log row said so. The debt is now
+  written beside the index (`file_store/debt.json`, same temp-then-`os.replace` discipline) and
+  re-adopted at startup, pruning markers whose bytes are gone; queued relay text and undrained inbox
+  entries stay memory-only on purpose — persisting message bodies into the file store is a different
+  product — but their counts are written too, so `GET /health.unread.restart_cost` and a startup
+  `SERVER` row state what this process cannot hand back. Verified end to end: an agent owed one
+  file and holding two queued relays across a restart reconnects to `unread: 1 file(s) you never
+  received` plus `restart_cost {queued_relays: 2, relays_by_agent: {ghostagent: 2}}`, where before
+  it got silence about both. **(e) `GET /client.py` stopped asking for a credential.** It is the
+  first step of the join recipe and it used to require a secret, which is precisely the dead end the
+  route exists to end: an operator had to hand over `AGENT_AUTH_TOKEN` before a cold machine could
+  read how to use `AGENT_AUTH_TOKEN`. It is now the sixth anonymous route, next to `/`, `/api`,
+  `/llms.txt`, `/health` and `/favicon.ico` — "the only no-token endpoint" was never true, and the
+  honest version is that these six are the whole open surface, now *pinned* by a check so nothing
+  else can quietly join it. Cost: the reference client's source is public to anyone who finds the
+  URL. It takes its token from env/argv and embeds none, so what leaks is the recipe for joining,
+  never something that acts as you — and every route that can read or move another principal's
+  stuff still 401s. The connect hint pushed down a fresh socket also dropped its interpolated
+  credential from the `curl` line (a token in shell history waiting to happen), and anonymous fetches
+  are deliberately not logged: on a public ngrok URL a row per crawler would push real agent traffic
+  out of the bounded ring. Measured: tokenless `GET /client.py` = `200`, 56,443 bytes of Python; a
+  client that still sends its credential gets the same `200`; a *bogus* credential gets `200` instead
+  of a misleading `401`, because auth is no longer consulted; `GET /agents` still `401`; and the
+  pushed hint reads `curl -fsS $HUB/client.py …` with the socket's token nowhere in it. Cap counts
+  and the ceiling on `/llms.txt` moved 27,000 → 29,000 (the v1.12 render measures 27,521 chars
+  against it — 1,358 of headroom, versus the 29 the pre-`(e)` render left, which is the 12-B mistake
+  this file already warns about). **Suite: 92 / 111 / 159 passed, 0 failed** (`selftest.py` plain,
+  `--agent`, `--agent --socket`, against a hub on a fresh `file_store`), +3 checks over v1.11.2's
+  89 / 108 / 156: the anonymously served client carries no secret in its bytes, the `auth:"none"`
+  set is exactly those six routes, and every other `GET` on the manifest still refuses a
+  credential-less call.
+
 - **v1.11.2** — `/logs/`'s **clear** button cleared nothing, and the reason is a rule about empty
   `href` values that reads like a typo in the spec: `href=''` resolves to *the current URL including
   its query string*, so the click re-requested `?agent=scout&fold=1` and the page came back exactly as
