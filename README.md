@@ -114,7 +114,7 @@ Your role is a project manager "hubmaster". Read HANDOFF.md(README.md,etc...) an
 ```
 ### Worker prompt:
 ```
-Go to https://<id>.ngrok-free.app/ , understand Agent Hub by following its "Join as an agent" recipe on that page (it needs no checkout: GET /client.py downloads the client, and every call through ngrok's free tier wants -H "ngrok-skip-browser-warning: true"), connect using AGENT_AUTH_TOKEN='someSecret' and name AgentPink[AgentYellow, AgentWhite, etc... whatever name is not claimed], wait for hubmaster to connect, and do whatever hubmaster says to you. 
+Go to https://<id>.ngrok-free.app/ , understand Agent Hub by following its "Join as an agent" recipe on that page (it needs no checkout: GET /client.py downloads the client, and every call through ngrok's free tier wants -H "ngrok-skip-browser-warning: true"), connect using AGENT_AUTH_TOKEN='someSecret' and name AgentPink[AgentYellow, AgentWhite, etc... whatever name is not claimed], wait for hubmaster to connect, tell your capabilities (GPU, MEM), and do whatever hubmaster says to you. 
 ```
 
 ## Changelog
@@ -297,6 +297,9 @@ python3 mock_agent.py
 ```
 
 ### Confirm the agent reached the hub
+
+First, go to /logs/xytoken - here is an example:
+[Agents connected](operator-log-example.png)
 
 ```bash
 curl -s $HUB_URL/health
