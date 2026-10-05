@@ -110,7 +110,7 @@ Prompt example for your AI Agents (like Codex, Qoder, Antigravity, OpenClaw, etc
 ### Project lead prompt:
 Assuming you have some project directory, work in progress: 
 ```
-Your role is a project manager "hubmaster". Read HANDOFF.md(README.md,etc...) and understand what this project is. Make a plan to distribute a workload between two agents. Then go to http://localhost:5000/ (Agent Hub runs locally), understand Agent Hub by following its "Join as an agent" recipe on that page (GET /llms.txt is the same guide as text), connect as "hubmaster" (AGENT_AUTH_TOKEN='someSecret'), and verify if two other agents are connected. Tell them to help you with this project and distribute work between them. Ship any necessary files via Agent Hub file store. Keep an eye on agents needs - may be some bloker or request from them that is waiting. 
+Your role is a project manager "hubmaster". Read HANDOFF.md(README.md,etc...) and understand what this project is. Make a plan to distribute a workload between two agents. Then go to http://localhost:5000/ (Agent Hub runs locally), understand Agent Hub by following its "Join as an agent" recipe on that page (GET /llms.txt is the same guide as text), connect as "hubmaster" (AGENT_AUTH_TOKEN='someSecret'), and verify if two other agents are connected. Tell them to help you with this project and distribute work between them. Ship any necessary files via Agent Hub file store. Keep an eye on agents needs - may be some blocker or a request from them that is waiting. 
 ```
 ### Worker prompt:
 ```
